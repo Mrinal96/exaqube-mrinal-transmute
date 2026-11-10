@@ -1,0 +1,50 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    environment:
+      APP_NAME: ${APP_NAME:-Transmute API}
+      APP_VERSION: ${APP_VERSION:-0.1.0}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      API_PREFIX: ${API_PREFIX:-/api}
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:3000}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      MOCK_LLM: ${MOCK_LLM:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      STORAGE_ROOT: /app/storage
+      MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-10}
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - uploads:/app/storage/uploads
+      - outputs:/app/storage/outputs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  uploads:
+  outputs:
+
