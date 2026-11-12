@@ -10,7 +10,7 @@ Transmute is an AI powered document transformation workspace for connecting sour
 
 ## Architecture
 
-The frontend owns canvas interaction and workflow editing state. The backend is organized around API routes, typed document/workflow models, a canonical intermediate representation, format specific readers, an LLM service boundary, DAG orchestration, output validation and persistent storage. The ingestion API validates and stores supported source documents, extracts their structure, and exposes metadata and IR. Semantic transformations are deliberately not implemented, and no output is presented as converted.
+The frontend owns canvas interaction and workflow editing state. The backend is organized around API routes, typed document/workflow models, a canonical intermediate representation, format specific readers, an LLM service boundary, DAG orchestration, output validation and persistent storage. The ingestion API validates and stores supported source documents, extracts their structure, and exposes metadata and IR. Interpretation and transformation planning use the LLM service; native artifact generation is implemented for HTML, DOCX and PPTX.
 
 Nginx exposes the backend at `/health` and `/api/*` on the same origin as the frontend. Docker Compose uses a named volume for uploads and outputs and waits for backend health before starting the frontend.
 
@@ -56,9 +56,15 @@ For local development, run the backend from `backend/` with `uvicorn app.main:ap
 - `POST /api/documents/{document_id}/interpretations/{interpretation_id}/plans` accepts a required `target_format` and optional `instructions`/`idempotency_key`. It uses the server-stored IR and interpretation and returns the plan, reuse flag, run ID, usage, and optional cost metadata.
 - `GET /api/documents/{document_id}/interpretations/{interpretation_id}/plans` lists plans for an interpretation; `GET /api/documents/{document_id}/plans` lists plans for a document; `GET /api/documents/{document_id}/plans/{plan_id}` retrieves a plan after checking its document association.
 
-Operations are synchronous. They return a `run_id`; successful and failed operation outcome records, usage, and pricing details are persisted under the `outputs` volume. No queued, rendering, cancellation, or workflow execution status is exposed. Input fingerprints reuse completed results. Optional idempotency keys are persisted and bound to the corresponding fingerprint. Per-fingerprint locks prevent duplicate provider calls within one backend process; they do not coordinate multiple workers or replicas.
+Interpretation and planning API operations are synchronous. They return a `run_id`; successful and failed operation outcome records, usage, and pricing details are persisted under the `outputs` volume. Input fingerprints reuse completed results. Optional idempotency keys are persisted and bound to the corresponding fingerprint. Per-fingerprint locks prevent duplicate provider calls within one backend process; they do not coordinate multiple workers or replicas.
 
-Provider requests retry only classified retryable failures, up to `LLM_MAX_ATTEMPTS` (1–5, default 3), using bounded exponential backoff and valid `Retry-After` hints. A retry is skipped when the provider's requested wait exceeds `LLM_MAX_RETRY_DELAY_SECONDS` (default 10, maximum 30), so the client never retries earlier than a valid server hint. Invalid provider JSON/schema output and permanent provider errors are not retried. Real-provider failures never fall back to mock mode.
+Workflow definitions and run snapshots are persisted under the `outputs` volume. `POST /api/workflows` validates and creates a workflow; `POST /api/workflows/{workflow_id}/runs` starts execution and returns a run ID. Run status and node results are available from `GET /api/workflows/{workflow_id}/runs/{run_id}`; run history is available from `GET /api/workflows/{workflow_id}/runs`. The executor processes a validated DAG in topological order, supports branching, passes completed upstream artifacts to dependent nodes, and records node/run states and failures. Run states include queued, running, done and failed; node states include reading, interpreting, planning, rendering, validating, done, failed and blocked. A failed node blocks its downstream dependents while independent branches can continue. Execution is scheduled with FastAPI background tasks, not a durable worker queue, and nodes are not run in parallel.
+
+`GET /api/events/workflows/{workflow_id}/runs/{run_id}` streams persisted run updates over Server-Sent Events and supports replay from a sequence ID. There is no workflow cancellation or restart/resume mechanism for an interrupted run.
+
+`POST /api/documents/{document_id}/transformations` creates a native artifact for a supported target format. `GET /api/documents/{document_id}/outputs/{output_id}/download` downloads the persisted output.
+
+Provider requests retry only classified retryable failures, up to `LLM_MAX_ATTEMPTS` (1-5, default 3), using bounded exponential backoff and provider timing hints. `LLM_MAX_RETRY_DELAY_SECONDS` defaults to 60 seconds and is capped at 60; a retry is skipped when the provider-requested wait exceeds the configured cap. Daily quota/billing errors, invalid provider JSON/schema output and permanent provider errors are not retried. Real-provider failures never fall back to mock mode.
 
 Token usage is returned when the provider reports it. Estimated USD cost is calculated only when both `LLM_INPUT_COST_PER_MILLION_TOKENS`, `LLM_OUTPUT_COST_PER_MILLION_TOKENS`, and `LLM_PRICING_VERSION` are configured and token counts are present. Otherwise `estimated_cost` is `null`; the response includes the configured pricing rates/version, and no provider prices are hardcoded.
 
@@ -72,18 +78,20 @@ Initial backend tests can be run from `backend/` with `python -m pytest app/test
 - A Pydantic canonical IR with nested sections, text/table/formula/chart/diagram blocks, entity/fact/claim/relationship fields, asset references, and provenance.
 - Upload progress, extraction feedback, structured errors, and an IR structure inspector in the existing workflow canvas.
 - Health endpoint and same-origin frontend status check.
-- Modular backend foundations for workflows, conversions, SSE events, logging, validation and semantic transformation. Interpretation and planning APIs are available; DAG execution and event streaming remain unimplemented.
+- LLM-backed semantic interpretation and target-specific transformation planning, with validated, separately persisted results and operation usage/cost metadata.
+- Persisted workflow definitions and runs; validated DAG execution with topological ordering, branching, run/node states, downstream blocking on failure, and independent-branch continuation.
+- SSE updates for workflow runs, including replay from a sequence ID, plus frontend Run Workflow integration and run-status refresh.
+- Native, editable HTML, DOCX and PPTX artifact generation, output validation, persistent artifact storage and download endpoints. PPTX supports text, bullets, tables and metrics; unsupported chart/image placeholders are rejected.
 - Docker Compose setup with independent frontend/backend services and health checks.
 
 ## Known limitations
 
-- Workflow persistence, DAG execution and SSE event streaming are not yet implemented.
-- The Run workflow action explains that execution is unavailable. Preview and download actions remain disabled until real outputs exist.
-- Interpretation and planning APIs execute synchronously. Workflow execution, DAG scheduling, event streaming, cancellation and output writers remain unimplemented.
+- Native output writers currently support HTML, DOCX and PPTX. XLSX and MMD can be ingested and used as sources, but their output contracts/renderers are unavailable; therefore all 20 directed conversions are not implemented.
+- Workflow nodes execute sequentially in one backend process through FastAPI background tasks. There is no durable job queue, parallel branch execution, cancellation endpoint, or automatic recovery/resume after a backend restart.
+- Workflow definitions and run snapshots persist, but the frontend does not restore the saved workflow definition/canvas layout after a page reload. It can restore the last run reference and reload its status/events.
+- PPTX chart and image-placeholder elements are explicitly unsupported. The writer produces editable text, bullet, table and metric content.
 - Per-fingerprint concurrency locks are process-local; use a durable coordination mechanism before running multiple backend workers or replicas.
-- The node canvas is currently in-memory and resets on page reload. Workflow controls and recent workflows are visual foundations.
 - Embedded media are retained as source references rather than decoded or visually interpreted; remote HTML media are referenced but not downloaded.
-- HTML and Mermaid checks verify text encoding and recognizable content/declarations; they do not implement full standards validators for either grammar.
+- HTML output receives structural validation, but there is no native Mermaid writer or full Mermaid grammar validation.
 - The upload endpoint does not run malware scanning. Storage is local and intended for this single-user assignment foundation.
-- The build and Docker startup must be verified in an environment with Node.js, Python 3.12 and Docker Desktop installed.
 
