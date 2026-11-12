@@ -18,7 +18,12 @@ from app.models.transformation import TransformationPlan
 from app.models.workflow_execution import WorkflowEvent, WorkflowOutputReference, WorkflowRun
 from app.orchestration.dag import topological_order
 from app.services.artifact_renderers import validate_rendered_output
-from app.services.artifact_transformation import ArtifactTransformationService, UnsupportedArtifactFormatError
+from app.services.artifact_transformation import (
+    ArtifactTransformationService,
+    UnsupportedArtifactElementError,
+    UnsupportedArtifactFormatError,
+)
+from app.services.artifact_contracts import ArtifactContractConfigurationError
 from app.services.interpretation import InterpretationService
 from app.services.llm_client import LLMProviderError
 from app.services.planning import PlanningService
@@ -28,6 +33,7 @@ from app.storage.transformations import TransformationStore
 from app.storage.workflows import WorkflowStore
 
 logger = logging.getLogger(__name__)
+WORKFLOW_INTERPRETATION_MAX_COMPLETION_TOKENS = 4096
 
 
 @dataclass(frozen=True)
@@ -181,7 +187,11 @@ class WorkflowExecutor:
                 if interpretation is None:
                     raise ValueError("The selected interpretation does not exist for this document.")
             else:
-                interpretation = await self.interpretation_service.interpret(context.document_ir, node.instruction or None)
+                interpretation = await self.interpretation_service.interpret(
+                    context.document_ir,
+                    node.instruction or None,
+                    max_completion_tokens=WORKFLOW_INTERPRETATION_MAX_COMPLETION_TOKENS,
+                )
             return NodeValue(context.document_ir, interpretation, usage=interpretation.provenance.token_usage)
 
         if node.kind == "planning":
@@ -248,8 +258,12 @@ class WorkflowExecutor:
 
     @staticmethod
     def _safe_error(exc: Exception) -> tuple[str, str]:
+        if isinstance(exc, ArtifactContractConfigurationError):
+            return "artifact_contract_unavailable", "Artifact generation is not configured for this target format."
         if isinstance(exc, UnsupportedArtifactFormatError):
             return "target_renderer_unavailable", "No native renderer is available for this target format."
+        if isinstance(exc, UnsupportedArtifactElementError):
+            return "unsupported_artifact_element", str(exc)
         if isinstance(exc, LLMProviderError):
             return "provider_error", "The configured model provider could not complete this node."
         if isinstance(exc, ValueError):

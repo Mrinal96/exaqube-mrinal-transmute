@@ -162,7 +162,10 @@ class OpenAICompatibleClient:
     """Small HTTPX client for providers implementing the chat-completions shape."""
 
     GROQ_GPT_OSS_120B = "openai/gpt-oss-120b"
+    GROQ_GPT_OSS_20B = "openai/gpt-oss-20b"
     GROQ_COMPLETION_TOKEN_BUDGET = 8192
+    GROQ_TPM_LIMIT = 8000
+    GROQ_PROMPT_ESTIMATE_SAFETY_TOKENS = 256
 
     def __init__(
         self,
@@ -187,7 +190,12 @@ class OpenAICompatibleClient:
         self._owns_client = http_client is None
         self._http = http_client or httpx.AsyncClient(timeout=timeout_seconds, transport=transport)
 
-    async def complete(self, messages: Sequence[LLMRequestMessage]) -> LLMCompletionResult:
+    async def complete(
+        self,
+        messages: Sequence[LLMRequestMessage],
+        *,
+        max_completion_tokens: int | None = None,
+    ) -> LLMCompletionResult:
         if not messages:
             error = LLMInvalidResponseError(
                 "At least one LLM request message is required.",
@@ -202,8 +210,32 @@ class OpenAICompatibleClient:
             "model": self.model,
             "messages": [message.model_dump(mode="json") for message in messages],
         }
+        if max_completion_tokens is not None:
+            if (
+                isinstance(max_completion_tokens, bool)
+                or not isinstance(max_completion_tokens, int)
+                or max_completion_tokens <= 0
+            ):
+                raise LLMConfigurationError("The requested completion-token budget must be a positive integer.")
+            effective_completion_budget = max_completion_tokens
+            if self.model == self.GROQ_GPT_OSS_20B:
+                prompt_characters = sum(len(message.content) for message in messages)
+                estimated_prompt_tokens = (prompt_characters + 3) // 4
+                available_budget = (
+                    self.GROQ_TPM_LIMIT
+                    - estimated_prompt_tokens
+                    - self.GROQ_PROMPT_ESTIMATE_SAFETY_TOKENS
+                )
+                if available_budget < 1:
+                    raise LLMInvalidResponseError(
+                        "The workflow interpretation prompt is too large for the provider token budget.",
+                        failure_phase="request_budget_validation",
+                        failure_reason="prompt_exceeds_tpm_budget",
+                    )
+                effective_completion_budget = min(effective_completion_budget, available_budget)
+            body["max_completion_tokens"] = effective_completion_budget
         if self.model == self.GROQ_GPT_OSS_120B:
-            body["max_completion_tokens"] = self.GROQ_COMPLETION_TOKEN_BUDGET
+            body.setdefault("max_completion_tokens", self.GROQ_COMPLETION_TOKEN_BUDGET)
             body["reasoning_effort"] = "low"
         request_body = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         request_content_bytes = sum(len(message.content.encode("utf-8")) for message in messages)
@@ -218,6 +250,7 @@ class OpenAICompatibleClient:
                 "estimated_prompt_tokens": (request_prompt_characters + 3) // 4,
                 "prompt_token_estimate_method": "characters_div_4_approximation",
                 "request_message_count": len(messages),
+                "max_completion_tokens": body.get("max_completion_tokens"),
             },
         )
         try:

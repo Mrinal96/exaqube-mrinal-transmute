@@ -25,14 +25,19 @@ from app.models.transformation import (
     OutputStructure,
     PlanSourceItem,
     PlanValidationRules,
+    PPTXElementPlan,
     PPTXOutputStructure,
+    PPTXPlanningOutputStructure,
+    PPTXSlidePlan,
+    PPTX_PROVIDER_SCHEMA_VERSION,
+    PPTXTransformationPlanDraft,
     TransformationMetadata,
     TransformationPlan,
     TransformationPlanDraft,
     TransformationProvenance,
     XLSXOutputStructure,
 )
-from app.prompts.transformation import PROMPT_VERSION, build_transformation_messages, semantic_source_items
+from app.prompts.transformation import build_transformation_messages, prompt_version_for, semantic_source_items
 from app.services.interpretation import SourceReferenceResolver, UnresolvedSourceReferenceError
 from app.services.llm import LLMService
 from app.storage.transformations import TransformationStore
@@ -111,16 +116,20 @@ class PlanningService:
         interpretation_fingerprint = self.store.fingerprint(interpretation.model_dump(mode="json"))
         instruction_fingerprint = hashlib.sha256((user_instructions or "").encode("utf-8")).hexdigest()
         provider_identity = self._provider_identity(interpretation)
-        input_fingerprint = self.store.fingerprint({
+        prompt_version = prompt_version_for(target)
+        fingerprint_payload = {
             "document_id": document_ir.document_id,
             "source_ir_fingerprint": source_ir_fingerprint,
             "interpretation_id": str(interpretation.interpretation_id),
             "interpretation_fingerprint": interpretation_fingerprint,
             "target_format": target.value,
             "user_instructions": user_instructions,
-            "prompt_version": PROMPT_VERSION,
+            "prompt_version": prompt_version,
             "provider_identity": provider_identity,
-        })
+        }
+        if target == DocumentFormat.PPTX:
+            fingerprint_payload["planning_schema_version"] = PPTX_PROVIDER_SCHEMA_VERSION
+        input_fingerprint = self.store.fingerprint(fingerprint_payload)
 
         if idempotency_key is not None:
             await asyncio.to_thread(
@@ -193,7 +202,7 @@ class PlanningService:
                     provenance=TransformationProvenance(
                         provider=completion.provider,
                         model=completion.model,
-                        prompt_version=PROMPT_VERSION,
+                        prompt_version=prompt_version,
                         created_at=datetime.now(timezone.utc),
                         is_mock=False,
                         token_usage=completion.usage,
@@ -256,7 +265,7 @@ class PlanningService:
             provenance=TransformationProvenance(
                 provider=completion.provider if completion else "mock",
                 model=completion.model if completion else "mock",
-                prompt_version=PROMPT_VERSION,
+                prompt_version=prompt_version_for(target),
                 created_at=datetime.now(timezone.utc),
                 is_mock=True,
                 token_usage=completion.usage if completion else None,
@@ -293,10 +302,124 @@ def _parse_plan_draft(content: str, target_format: DocumentFormat) -> Transforma
             omissions=provider_draft.omissions,
             warnings=provider_draft.warnings,
         )
+    if target_format == DocumentFormat.PPTX:
+        try:
+            provider_draft = PPTXTransformationPlanDraft.model_validate_json(content)
+        except (ValidationError, ValueError) as exc:
+            raise InvalidPlanResponseError("The LLM response did not match the required transformation plan schema.") from exc
+        output_structure = _materialize_pptx_mapping_ids(
+            provider_draft.output_structure,
+            provider_draft.content_mappings,
+        )
+        return TransformationPlanDraft(
+            target_format=provider_draft.target_format,
+            output_structure=output_structure,
+            content_mappings=provider_draft.content_mappings,
+            generation_instructions=provider_draft.generation_instructions,
+            preservation_rules=provider_draft.preservation_rules,
+            omissions=provider_draft.omissions,
+            warnings=provider_draft.warnings,
+        )
     try:
         return TransformationPlanDraft.model_validate_json(content)
     except (ValidationError, ValueError) as exc:
         raise InvalidPlanResponseError("The LLM response did not match the required transformation plan schema.") from exc
+
+
+def _materialize_pptx_mapping_ids(
+    provider_structure: PPTXPlanningOutputStructure,
+    mappings: list[ContentMapping],
+) -> PPTXOutputStructure:
+    """Validate provider destinations, then derive final mapping_ids without redirection."""
+    slide_indexes: dict[tuple[str, str], int] = {}
+    element_indexes: dict[tuple[str, str], tuple[int, int]] = {}
+    slide_mapping_ids: list[list[str]] = [[] for _ in provider_structure.slides]
+    element_mapping_ids: list[list[list[str]]] = [
+        [[] for _ in slide.elements] for slide in provider_structure.slides
+    ]
+
+    for slide_index, slide in enumerate(provider_structure.slides):
+        slide_key = ("slide", slide.slide_id)
+        if slide_key in slide_indexes:
+            raise _plan_validation_error(
+                "PPTX slide IDs must be unique.",
+                category="duplicate_destination_id",
+                path=["output_structure", "slides", slide_index, "slide_id"],
+            )
+        slide_indexes[slide_key] = slide_index
+        for element_index, element in enumerate(slide.elements):
+            element_key = ("slide_element", element.element_id)
+            if element_key in element_indexes:
+                raise _plan_validation_error(
+                    "PPTX element IDs must be unique.",
+                    category="duplicate_destination_id",
+                    path=["output_structure", "slides", slide_index, "elements", element_index, "element_id"],
+                )
+            element_indexes[element_key] = (slide_index, element_index)
+
+    seen_mapping_ids: set[str] = set()
+    for mapping_index, mapping in enumerate(mappings):
+        if mapping.mapping_id in seen_mapping_ids:
+            raise _plan_validation_error(
+                "Transformation mapping IDs must be unique.",
+                category="duplicate_mapping_id",
+                path=["content_mappings", mapping_index, "mapping_id"],
+            )
+        seen_mapping_ids.add(mapping.mapping_id)
+
+        target_type = mapping.destination.target_type
+        target_id = mapping.destination.target_id
+        destination_key = (target_type, target_id)
+        if target_type == "slide":
+            slide_index = slide_indexes.get(destination_key)
+            if slide_index is None:
+                raise _plan_validation_error(
+                    "A PPTX mapping destination must reference a declared slide_id.",
+                    category="unknown_pptx_destination",
+                    path=["content_mappings", mapping_index, "destination", "target_id"],
+                )
+            slide_mapping_ids[slide_index].append(mapping.mapping_id)
+        elif target_type == "slide_element":
+            element_location = element_indexes.get(destination_key)
+            if element_location is None:
+                raise _plan_validation_error(
+                    "A PPTX mapping destination must reference a declared element_id.",
+                    category="unknown_pptx_destination",
+                    path=["content_mappings", mapping_index, "destination", "target_id"],
+                )
+            slide_index, element_index = element_location
+            element_mapping_ids[slide_index][element_index].append(mapping.mapping_id)
+        else:
+            raise _plan_validation_error(
+                "PPTX mapping destinations must use slide or slide_element.",
+                category="invalid_pptx_destination_type",
+                path=["content_mappings", mapping_index, "destination", "target_type"],
+            )
+
+    final_slides = [
+        PPTXSlidePlan(
+            slide_id=slide.slide_id,
+            title=slide.title,
+            purpose=slide.purpose,
+            visual_guidance=slide.visual_guidance,
+            mapping_ids=slide_mapping_ids[slide_index],
+            elements=[
+                PPTXElementPlan(
+                    element_id=element.element_id,
+                    element_type=element.element_type,
+                    purpose=element.purpose,
+                    mapping_ids=element_mapping_ids[slide_index][element_index],
+                )
+                for element_index, element in enumerate(slide.elements)
+            ],
+        )
+        for slide_index, slide in enumerate(provider_structure.slides)
+    ]
+    return PPTXOutputStructure(
+        target_format="pptx",
+        presentation_title=provider_structure.presentation_title,
+        slides=final_slides,
+    )
 
 
 def validate_transformation_draft(

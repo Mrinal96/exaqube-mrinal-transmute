@@ -11,6 +11,7 @@ import pytest
 from bs4 import BeautifulSoup
 from docx import Document as WordDocument
 from fastapi.testclient import TestClient
+from pptx import Presentation
 
 from app.config import Settings, get_settings
 from app.api.operation_responses import usage_and_cost
@@ -411,7 +412,7 @@ def test_json_logs_receive_request_run_and_operation_context():
     assert node_payload["node_id"] == "node-2"
 
 
-def test_mock_transformations_render_and_download_native_html_and_docx(api):
+def test_mock_transformations_render_and_download_native_html_docx_and_pptx(api):
     client, _, _ = api
     document_id = upload_html(client)
     interpretation_response = client.post(f"/api/documents/{document_id}/interpretations", json={})
@@ -455,6 +456,30 @@ def test_mock_transformations_render_and_download_native_html_and_docx(api):
     text = "\n".join(paragraph.text for paragraph in document.paragraphs)
     assert "Revenue was $12 million." in text
     assert "MOCK OUTPUT" in text
+
+    pptx_response = client.post(
+        f"/api/documents/{document_id}/transformations",
+        json={"target_format": "pptx"},
+    )
+    assert pptx_response.status_code == 201, pptx_response.text
+    pptx_body = pptx_response.json()
+    assert pptx_body["output"]["target_format"] == "pptx"
+    assert pptx_body["output"]["is_mock"] is True
+    pptx_download = client.get(pptx_body["download_url"])
+    assert pptx_download.status_code == 200
+    assert pptx_download.headers["content-type"].startswith(
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    )
+    presentation = Presentation(BytesIO(pptx_download.content))
+    assert len(presentation.slides) >= 1
+    pptx_text = "\n".join(
+        shape.text
+        for slide in presentation.slides
+        for shape in slide.shapes
+        if shape.has_text_frame
+    )
+    assert "Revenue was $12 million." in pptx_text
+    assert "MOCK OUTPUT" in pptx_text
 
 
 def test_configured_llm_generates_valid_cited_html_artifact(api):
@@ -526,12 +551,111 @@ def test_configured_llm_generates_valid_cited_html_artifact(api):
     assert client.get(body["download_url"]).status_code == 200
 
 
+def test_configured_llm_generates_valid_cited_pptx_artifact(api):
+    client, configure, original_settings = api
+    document_id = upload_html(client)
+    ir = client.get(f"/api/documents/{document_id}/ir").json()
+
+    def find_text_block(sections):
+        for section in sections:
+            for block in section["blocks"]:
+                if block["kind"] == "text":
+                    return section, block
+            found = find_text_block(section["children"])
+            if found is not None:
+                return found
+        return None
+
+    source_section, source_block = find_text_block(ir["sections"])
+    reference = {
+        "block_id": source_block["id"],
+        "section_id": source_section["id"],
+        "source_location": source_block["source"],
+    }
+    provider = StaticClient(
+        is_mock=False,
+        usage=LLMTokenUsage(prompt_tokens=120, completion_tokens=80, total_tokens=200),
+        content=json.dumps({
+            "summary": "The report states revenue of $12 million.",
+            "facts": [], "metrics": [], "entities": [], "claims": [],
+            "relationships": [], "insights": [], "warnings": [],
+        }),
+    )
+    configure(Settings(
+        _env_file=None,
+        storage_root=original_settings.storage_root,
+        mock_llm=False,
+        llm_base_url="https://example.test/v1",
+        llm_model="artifact-test-model",
+    ), provider)
+    assert client.post(f"/api/documents/{document_id}/interpretations", json={}).status_code == 201
+    pptx_content = {
+        "target_format": "pptx",
+        "presentation_title": "Revenue Brief",
+        "slides": [{
+            "slide_id": "slide-revenue",
+            "title": "Revenue",
+            "purpose": "Summarize the reported revenue result.",
+            "visual_guidance": "Keep the slide simple and emphasize the reported amount.",
+            "title_source_references": [reference],
+            "elements": [{
+                "element_id": "element-revenue",
+                "element_type": "paragraph",
+                "content": {"text": "Revenue was $12 million.", "source_references": [reference]},
+            }],
+        }],
+    }
+    provider.content = json.dumps(pptx_content)
+    response = client.post(
+        f"/api/documents/{document_id}/transformations",
+        json={"target_format": "pptx", "instructions": "Create a concise revenue deck."},
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["output"]["is_mock"] is False
+    assert body["output"]["artifact_schema_version"] == "1.0"
+    assert body["usage"] == {"input_tokens": 120, "output_tokens": 80, "total_tokens": 200}
+    downloaded = client.get(body["download_url"])
+    assert downloaded.status_code == 200
+    presentation = Presentation(BytesIO(downloaded.content))
+    slide = presentation.slides[0]
+    assert "Revenue was $12 million." in "\n".join(
+        shape.text for shape in slide.shapes if shape.has_text_frame
+    )
+    notes = slide.notes_slide.notes_text_frame.text
+    assert '"block_id"' in notes
+    assert "Summarize the reported revenue result." in notes
+    assert "Keep the slide simple and emphasize the reported amount." in notes
+
+    invalid_content = {**pptx_content, "undeclared_contract_field": "private fixture value"}
+    provider.content = json.dumps(invalid_content)
+    invalid = client.post(
+        f"/api/documents/{document_id}/transformations",
+        json={"target_format": "pptx", "instructions": "Create a concise revenue deck."},
+    )
+    assert invalid.status_code == 502
+    error = invalid.json()["error"]
+    assert error["code"] == "invalid_artifact_output"
+    diagnostics = error["details"]
+    assert diagnostics["target_format"] == "pptx"
+    assert diagnostics["schema_model"] == "PPTXArtifactContent"
+    assert diagnostics["prompt_version"] == "artifact_v6"
+    assert diagnostics["artifact_schema_version"] == "1.0"
+    assert diagnostics["json_parsing_succeeded"] is True
+    assert any(
+        item["field_path"] == ["undeclared_contract_field"]
+        and item["category"] == "undeclared_field"
+        for item in diagnostics["validation_errors"]
+    )
+    assert "private fixture value" not in invalid.text
+
+
 def test_transform_rejects_unsupported_target_and_missing_interpretation(api):
     client, _, _ = api
     document_id = upload_html(client)
     unsupported = client.post(
         f"/api/documents/{document_id}/transformations",
-        json={"target_format": "pptx"},
+        json={"target_format": "xlsx"},
     )
     assert unsupported.status_code == 422
     assert unsupported.json()["error"]["code"] == "target_renderer_unavailable"
@@ -596,6 +720,89 @@ def test_workflow_dag_executes_html_to_interpretation_plan_docx_and_download(api
     assert "event: run_completed" in events.text
 
 
+def test_workflow_interpretation_requests_4096_completion_tokens(api, monkeypatch):
+    client, _, _ = api
+    requested_budgets = []
+    original_complete = LLMService.complete
+
+    async def record_budget(self, messages, *, max_completion_tokens=None):
+        requested_budgets.append(max_completion_tokens)
+        return await original_complete(self, messages, max_completion_tokens=max_completion_tokens)
+
+    monkeypatch.setattr(LLMService, "complete", record_budget)
+    document_id = upload_html(client)
+    definition = client.post("/api/workflows", json={
+        "name": "Workflow interpretation budget",
+        "nodes": [
+            {"id": "source", "kind": "source", "document_id": document_id, "source_format": "html"},
+            {"id": "interpret", "kind": "interpretation"},
+            {"id": "plan", "kind": "planning", "target_format": "docx"},
+            {"id": "transform", "kind": "transformation", "target_format": "docx"},
+            {"id": "output", "kind": "output"},
+        ],
+        "edges": [
+            {"source": "source", "target": "interpret"},
+            {"source": "interpret", "target": "plan"},
+            {"source": "plan", "target": "transform"},
+            {"source": "transform", "target": "output"},
+        ],
+    })
+    assert definition.status_code == 201, definition.text
+    workflow_id = definition.json()["id"]
+    queued = client.post(f"/api/workflows/{workflow_id}/runs", json={})
+    assert queued.status_code == 202, queued.text
+
+    run = client.get(f"/api/workflows/{workflow_id}/runs/{queued.json()['run_id']}").json()
+    assert run["status"] == "done"
+    assert all(
+        run["node_results"][node_id]["status"] == "done"
+        for node_id in ("source", "interpret", "plan", "transform", "output")
+    )
+    assert requested_budgets == [4096]
+
+
+def test_workflow_dag_executes_html_to_pptx_and_download(api):
+    client, _, _ = api
+    document_id = upload_html(client)
+    definition = client.post("/api/workflows", json={
+        "name": "HTML to PowerPoint",
+        "nodes": [
+            {"id": "source", "kind": "source", "document_id": document_id, "source_format": "html"},
+            {"id": "interpret", "kind": "interpretation"},
+            {"id": "plan", "kind": "planning", "target_format": "pptx"},
+            {"id": "render", "kind": "transformation", "target_format": "pptx"},
+            {"id": "output", "kind": "output"},
+        ],
+        "edges": [
+            {"source": "source", "target": "interpret"},
+            {"source": "interpret", "target": "plan"},
+            {"source": "plan", "target": "render"},
+            {"source": "render", "target": "output"},
+        ],
+    })
+    assert definition.status_code == 201, definition.text
+    workflow_id = definition.json()["id"]
+    queued = client.post(f"/api/workflows/{workflow_id}/runs", json={})
+    assert queued.status_code == 202, queued.text
+    run_id = queued.json()["run_id"]
+    run = client.get(f"/api/workflows/{workflow_id}/runs/{run_id}").json()
+    assert run["status"] == "done"
+    assert all(run["node_results"][node]["status"] == "done" for node in ("source", "interpret", "plan", "render", "output"))
+    output = run["node_results"]["output"]
+    assert output["output"]["target_format"] == "pptx"
+    downloaded = client.get(output["download_url"])
+    assert downloaded.status_code == 200
+    presentation = Presentation(BytesIO(downloaded.content))
+    assert len(presentation.slides) > 0
+    rendered_text = "\n".join(
+        shape.text
+        for slide in presentation.slides
+        for shape in slide.shapes
+        if shape.has_text_frame
+    )
+    assert "Revenue was $12 million." in rendered_text
+
+
 def test_workflow_dag_detects_cycles_and_incompatible_edges(api):
     client, _, _ = api
     document_id = upload_html(client)
@@ -629,8 +836,68 @@ def test_workflow_dag_detects_cycles_and_incompatible_edges(api):
 
 
 def test_workflow_branch_failure_blocks_only_its_downstream_output(api):
-    client, _, _ = api
+    client, configure, original_settings = api
     document_id = upload_html(client)
+    ir = client.get(f"/api/documents/{document_id}/ir").json()
+
+    def find_text_block(sections):
+        for section in sections:
+            for block in section["blocks"]:
+                if block["kind"] == "text":
+                    return section, block
+            found = find_text_block(section["children"])
+            if found is not None:
+                return found
+        return None
+
+    source_section, source_block = find_text_block(ir["sections"])
+    reference = {
+        "block_id": source_block["id"],
+        "section_id": source_section["id"],
+        "source_location": source_block["source"],
+    }
+
+    class BranchProvider:
+        def __init__(self):
+            self.calls = 0
+
+        async def complete(self, messages):
+            self.calls += 1
+            if self.calls == 1:
+                content = {
+                    "summary": "The report states revenue of $12 million.",
+                    "facts": [], "metrics": [], "entities": [], "claims": [],
+                    "relationships": [], "insights": [], "warnings": [],
+                }
+            else:
+                content = {
+                    "target_format": "html",
+                    "page_title": "Revenue",
+                    "sections": [{
+                        "heading": "Revenue",
+                        "paragraphs": [{
+                            "text": "Revenue was $12 million.",
+                            "source_references": [reference],
+                        }],
+                    }],
+                }
+            return LLMCompletionResult(
+                content=json.dumps(content),
+                model="branch-test-model",
+                provider="branch-test-provider",
+                usage=LLMTokenUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+                is_mock=False,
+            )
+
+    provider = BranchProvider()
+    configure(Settings(
+        _env_file=None,
+        storage_root=original_settings.storage_root,
+        mock_llm=False,
+        llm_base_url="https://example.test/v1",
+        llm_model="branch-test-model",
+    ), provider)
+
     definition = client.post("/api/workflows", json={
         "name": "Branch validation",
         "nodes": [
@@ -638,7 +905,7 @@ def test_workflow_branch_failure_blocks_only_its_downstream_output(api):
             {"id": "interpret", "kind": "interpretation"},
             {"id": "good", "kind": "transformation", "target_format": "html"},
             {"id": "good-output", "kind": "output"},
-            {"id": "unsupported", "kind": "transformation", "target_format": "pptx"},
+            {"id": "unsupported", "kind": "transformation", "target_format": "xlsx"},
             {"id": "unsupported-output", "kind": "output"},
         ],
         "edges": [
@@ -654,6 +921,13 @@ def test_workflow_branch_failure_blocks_only_its_downstream_output(api):
     queued = client.post(f"/api/workflows/{workflow_id}/runs", json={})
     run = client.get(f"/api/workflows/{workflow_id}/runs/{queued.json()['run_id']}").json()
     assert run["status"] == "failed"
+    assert run["node_results"]["source"]["status"] == "done"
+    assert run["node_results"]["interpret"]["status"] == "done"
+    assert run["node_results"]["good"]["status"] == "done"
     assert run["node_results"]["good-output"]["status"] == "done"
-    assert run["node_results"]["unsupported"]["error_code"] == "target_renderer_unavailable"
+    assert run["node_results"]["unsupported"]["status"] == "failed"
+    assert run["node_results"]["unsupported"]["error_code"] == "artifact_contract_unavailable"
     assert run["node_results"]["unsupported-output"]["status"] == "blocked"
+    # One interpretation and one supported HTML artifact request; XLSX preflight
+    # fails without issuing a third request to the configured provider.
+    assert provider.calls == 2

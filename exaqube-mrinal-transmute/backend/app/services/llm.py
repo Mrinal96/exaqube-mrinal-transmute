@@ -56,10 +56,21 @@ class LLMService:
     def is_available(self) -> bool:
         return True
 
-    async def complete(self, messages: Sequence[LLMRequestMessage]) -> LLMCompletionResult:
+    async def complete(
+        self,
+        messages: Sequence[LLMRequestMessage],
+        *,
+        max_completion_tokens: int | None = None,
+    ) -> LLMCompletionResult:
         for attempt in range(self.settings.llm_max_attempts):
             try:
-                result = await self.client.complete(messages)
+                if max_completion_tokens is not None and isinstance(self.client, OpenAICompatibleClient):
+                    result = await self.client.complete(
+                        messages,
+                        max_completion_tokens=max_completion_tokens,
+                    )
+                else:
+                    result = await self.client.complete(messages)
                 if result.finish_reason == "length":
                     usage = result.usage
                     logger.warning(

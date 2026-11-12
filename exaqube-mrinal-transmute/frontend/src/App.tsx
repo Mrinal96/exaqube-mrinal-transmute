@@ -737,19 +737,6 @@ export default function App() {
     }
   }, [])
 
-  // Listen to custom download or error notices from canvas nodes
-  useEffect(() => {
-    const handleNoticeEvent = (e: Event) => {
-      const customEvent = e as CustomEvent<string>
-      if (customEvent.detail) {
-        setNotice(customEvent.detail)
-        window.setTimeout(() => setNotice(''), 4500)
-      }
-    }
-    window.addEventListener('transmute-notice', handleNoticeEvent)
-    return () => window.removeEventListener('transmute-notice', handleNoticeEvent)
-  }, [])
-
   // Keyboard shortcuts: Ctrl+Enter runs workflow, Ctrl+S saves workflow
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -864,6 +851,8 @@ export default function App() {
   const handleNodeClick = useCallback(
     (nodeId: string) => {
       setSelected(nodeId)
+      setPanelOpen(true)
+      setRightTab('properties')
 
       const clickedNode = nodes.find((n) => n.id === nodeId)
       if (!clickedNode) return
@@ -1124,6 +1113,117 @@ export default function App() {
       )
     }
   }, [activeTargetNode?.id, setNodes])
+
+  // Listen to custom events dispatched from canvas nodes
+  useEffect(() => {
+    const handleNoticeEvent = (e: Event) => {
+      const customEvent = e as CustomEvent<string>
+      if (customEvent.detail) {
+        setNotice(customEvent.detail)
+        window.setTimeout(() => setNotice(''), 4500)
+      }
+    }
+
+    const handleSelectNodeEvent = (e: Event) => {
+      const customEvent = e as CustomEvent<{ nodeId: string }>
+      if (customEvent.detail?.nodeId) {
+        handleNodeClick(customEvent.detail.nodeId)
+      }
+    }
+
+    const handleInspectNodeEvent = (e: Event) => {
+      const customEvent = e as CustomEvent<{ nodeId: string; documentId?: string }>
+      if (customEvent.detail) {
+        const docId = customEvent.detail.documentId || customEvent.detail.nodeId
+        if (documentsMap[docId]) {
+          setUploadedDocument(documentsMap[docId])
+        }
+        if (documentIRMap[docId]) {
+          setDocumentIR(documentIRMap[docId])
+        }
+        setInspectorOpen(true)
+      }
+    }
+
+    const handleDeleteNodeEvent = (e: Event) => {
+      const customEvent = e as CustomEvent<{ nodeId: string }>
+      const nodeId = customEvent.detail?.nodeId
+      if (nodeId) {
+        setNodes((current) => current.filter((n) => n.id !== nodeId))
+        setEdges((current) => current.filter((edge) => edge.source !== nodeId && edge.target !== nodeId))
+        setSelected((prev) => (prev === nodeId ? undefined : prev))
+        setIsSaved(false)
+        setNotice('Node removed from canvas.')
+        window.setTimeout(() => setNotice(''), 3000)
+      }
+    }
+
+    const handleChangeFormatEvent = (e: Event) => {
+      const customEvent = e as CustomEvent<{ nodeId: string; format: DocumentFormat }>
+      if (customEvent.detail?.nodeId && customEvent.detail?.format) {
+        handleTargetFormatChange(customEvent.detail.format, customEvent.detail.nodeId)
+        setIsSaved(false)
+        setNotice(`Target format changed to ${customEvent.detail.format.toUpperCase()}`)
+        window.setTimeout(() => setNotice(''), 3000)
+      }
+    }
+
+    const handleClearArtifactEvent = (e: Event) => {
+      const customEvent = e as CustomEvent<{ nodeId: string }>
+      if (customEvent.detail?.nodeId) {
+        handleClearArtifact(customEvent.detail.nodeId)
+        setIsSaved(false)
+        setNotice('Output artifact cleared.')
+        window.setTimeout(() => setNotice(''), 3000)
+      }
+    }
+
+    const handleUpdateInstructionEvent = (e: Event) => {
+      const customEvent = e as CustomEvent<{ nodeId: string; instruction: string }>
+      if (customEvent.detail?.nodeId !== undefined) {
+        updateInstruction(customEvent.detail.nodeId, customEvent.detail.instruction)
+        setIsSaved(false)
+      }
+    }
+
+    const handlePreviewArtifactEvent = (e: Event) => {
+      const customEvent = e as CustomEvent<{ downloadUrl?: string; filename?: string; format?: string }>
+      if (customEvent.detail?.downloadUrl) {
+        window.open(customEvent.detail.downloadUrl, '_blank')
+        setNotice(`Previewing ${customEvent.detail.filename || 'artifact'}`)
+        window.setTimeout(() => setNotice(''), 3500)
+      }
+    }
+
+    window.addEventListener('transmute-notice', handleNoticeEvent)
+    window.addEventListener('transmute-select-node', handleSelectNodeEvent)
+    window.addEventListener('transmute-inspect-node', handleInspectNodeEvent)
+    window.addEventListener('transmute-delete-node', handleDeleteNodeEvent)
+    window.addEventListener('transmute-change-format', handleChangeFormatEvent)
+    window.addEventListener('transmute-clear-artifact', handleClearArtifactEvent)
+    window.addEventListener('transmute-update-instruction', handleUpdateInstructionEvent)
+    window.addEventListener('transmute-preview-artifact', handlePreviewArtifactEvent)
+
+    return () => {
+      window.removeEventListener('transmute-notice', handleNoticeEvent)
+      window.removeEventListener('transmute-select-node', handleSelectNodeEvent)
+      window.removeEventListener('transmute-inspect-node', handleInspectNodeEvent)
+      window.removeEventListener('transmute-delete-node', handleDeleteNodeEvent)
+      window.removeEventListener('transmute-change-format', handleChangeFormatEvent)
+      window.removeEventListener('transmute-clear-artifact', handleClearArtifactEvent)
+      window.removeEventListener('transmute-update-instruction', handleUpdateInstructionEvent)
+      window.removeEventListener('transmute-preview-artifact', handlePreviewArtifactEvent)
+    }
+  }, [
+    handleNodeClick,
+    documentsMap,
+    documentIRMap,
+    setNodes,
+    setEdges,
+    handleTargetFormatChange,
+    handleClearArtifact,
+    updateInstruction,
+  ])
 
   return <div className="app-shell"><Sidebar onNew={() => {
     if (sseCleanupRef.current) {

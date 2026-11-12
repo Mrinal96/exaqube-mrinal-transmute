@@ -588,13 +588,38 @@ def test_artifact_schema_failure_logs_sanitized_diagnostics(caplog):
 
     record = next(item for item in caplog.records if item.message == "artifact_content_validation_failed")
     assert record.failure_phase == "artifact_schema_validation"
+    assert record.target_format == "docx"
+    assert record.schema_model == "DOCXArtifactContent"
+    assert record.prompt_version == "artifact_v6"
+    assert record.artifact_schema_version == "1.0"
     assert record.json_parsing_succeeded is True
     assert record.content_empty is False
     assert record.contains_markdown_code_fence is False
     assert record.finish_reason == "stop"
     assert (record.prompt_tokens, record.completion_tokens, record.total_tokens) == (3482, 2600, 6082)
     assert any("source_references" in error["location"] for error in record.pydantic_errors)
+    assert any(error["category"] == "missing_field" for error in record.pydantic_errors)
     assert "PRIVATE_SENTINEL_CONTENT" not in caplog.text
+
+
+def test_artifact_type_error_returns_sanitized_structured_diagnostics(caplog):
+    payload = _valid_docx_payload()
+    payload["document_title"] = {"private": "must not be echoed"}
+    with caplog.at_level(logging.ERROR, logger="app.services.artifact_transformation"):
+        with pytest.raises(InvalidArtifactContentError) as error:
+            _parse_artifact_content(json.dumps(payload), DocumentFormat.DOCX)
+
+    details = error.value.diagnostics
+    assert details is not None
+    assert details["target_format"] == "docx"
+    assert details["schema_model"] == "DOCXArtifactContent"
+    assert details["error_category"] == "schema_validation"
+    assert any(
+        item["field_path"] == ["document_title"]
+        and item["category"] == "incorrect_type"
+        for item in details["validation_errors"]
+    )
+    assert "must not be echoed" not in caplog.text
 
 
 def test_artifact_invalid_json_logs_parse_failure_without_response_content(caplog):

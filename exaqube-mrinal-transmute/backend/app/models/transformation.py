@@ -90,6 +90,61 @@ class PPTXOutputStructure(BaseModel):
     slides: list[PPTXSlidePlan] = Field(min_length=1)
 
 
+PPTX_PROVIDER_SCHEMA_VERSION = "2.0"
+
+
+class PPTXPlanningElementDraft(BaseModel):
+    """Provider-facing PPTX element outline; placement lives on ContentMapping."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    element_id: str = Field(min_length=1)
+    element_type: Literal["title", "paragraph", "bullets", "table", "chart", "callout", "image_placeholder"]
+    purpose: str
+
+
+class PPTXPlanningSlideDraft(BaseModel):
+    """Provider-facing PPTX slide outline without duplicated mapping placement."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    slide_id: str = Field(min_length=1)
+    title: str
+    purpose: str
+    visual_guidance: str = ""
+    elements: list[PPTXPlanningElementDraft] = Field(default_factory=list)
+
+
+class PPTXPlanningOutputStructure(BaseModel):
+    """LLM response structure; ContentMapping.destination is authoritative."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_format: Literal["pptx"]
+    presentation_title: str
+    slides: list[PPTXPlanningSlideDraft] = Field(min_length=1)
+
+
+class PPTXTransformationPlanDraft(BaseModel):
+    """Provider response contract for PPTX planning before trusted materialization."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_format: Literal["pptx"]
+    output_structure: PPTXPlanningOutputStructure
+    content_mappings: list[ContentMapping] = Field(default_factory=list)
+    generation_instructions: list[str] = Field(min_length=1)
+    preservation_rules: list[str] = Field(min_length=1)
+    omissions: list[OmittedContent] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def structure_matches_requested_format(self) -> "PPTXTransformationPlanDraft":
+        if self.output_structure.target_format != self.target_format:
+            raise ValueError("Output structure target format must match the requested target format.")
+        return self
+
+
 class XLSXColumnPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

@@ -1,13 +1,15 @@
 """Validated target document content and persisted artifact metadata."""
 
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Annotated, Literal, Union
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.models.documents import DocumentFormat
 from app.models.interpretation import MetricValue, SourceReference
+
+ARTIFACT_SCHEMA_VERSION = "1.0"
 
 
 class ArtifactText(BaseModel):
@@ -77,6 +79,95 @@ class DOCXArtifactContent(BaseModel):
     sections: list[ArtifactSection] = Field(min_length=1)
 
 
+class PPTXTitleElement(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    element_id: str = Field(min_length=1)
+    element_type: Literal["title"]
+    mapping_ids: list[str] = Field(default_factory=list)
+    content: ArtifactText
+
+
+class PPTXParagraphElement(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    element_id: str = Field(min_length=1)
+    element_type: Literal["paragraph"]
+    mapping_ids: list[str] = Field(default_factory=list)
+    content: ArtifactText
+
+
+class PPTXCalloutElement(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    element_id: str = Field(min_length=1)
+    element_type: Literal["callout"]
+    mapping_ids: list[str] = Field(default_factory=list)
+    content: ArtifactText
+
+
+class PPTXBulletsElement(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    element_id: str = Field(min_length=1)
+    element_type: Literal["bullets"]
+    mapping_ids: list[str] = Field(default_factory=list)
+    items: list[ArtifactText] = Field(min_length=1)
+
+
+class PPTXTableElement(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    element_id: str = Field(min_length=1)
+    element_type: Literal["table"]
+    mapping_ids: list[str] = Field(default_factory=list)
+    content: ArtifactTable
+
+
+class PPTXMetricElement(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    element_id: str = Field(min_length=1)
+    element_type: Literal["metric"]
+    mapping_ids: list[str] = Field(default_factory=list)
+    content: ArtifactMetric
+
+
+PPTXArtifactElement = Annotated[
+    Union[
+        PPTXTitleElement,
+        PPTXParagraphElement,
+        PPTXCalloutElement,
+        PPTXBulletsElement,
+        PPTXTableElement,
+        PPTXMetricElement,
+    ],
+    Field(discriminator="element_type"),
+]
+
+
+class PPTXArtifactSlide(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    slide_id: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    purpose: str | None = None
+    visual_guidance: str | None = None
+    title_source_references: list[SourceReference] = Field(default_factory=list)
+    mapping_ids: list[str] = Field(default_factory=list)
+    elements: list[PPTXArtifactElement] = Field(default_factory=list)
+
+
+class PPTXArtifactContent(BaseModel):
+    """Strict editable slide content; trusted provenance is added by the service."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_format: Literal["pptx"]
+    presentation_title: str = Field(min_length=1)
+    slides: list[PPTXArtifactSlide] = Field(min_length=1)
+
+
 class ArtifactMetadata(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -88,6 +179,7 @@ class ArtifactMetadata(BaseModel):
     provider: str
     model: str
     prompt_version: str
+    artifact_schema_version: str = ARTIFACT_SCHEMA_VERSION
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     is_mock: bool
     warnings: list[str] = Field(default_factory=list)

@@ -7,6 +7,7 @@ from bs4 import BeautifulSoup
 from docx import Document
 
 from app.models.artifacts import ArtifactSection, DOCXArtifactContent, HTMLArtifactContent
+from app.services.pptx_writer import validate_pptx_output
 
 
 MOCK_NOTICE = (
@@ -147,5 +148,8 @@ def validate_rendered_output(content: bytes, target_format: str) -> None:
         document = Document(BytesIO(content))
         if not document.paragraphs or not any(paragraph.text.strip() for paragraph in document.paragraphs):
             raise ValueError("The rendered DOCX failed structural validation.")
+        return
+    if target_format == "pptx":
+        validate_pptx_output(content)
         return
     raise ValueError("No renderer is available for this format.")

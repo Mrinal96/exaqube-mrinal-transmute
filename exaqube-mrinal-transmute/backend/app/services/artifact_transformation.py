@@ -19,14 +19,26 @@ from app.models.artifacts import (
     DOCXArtifactContent,
     HTMLArtifactContent,
     HTMLArtifactSection,
+    PPTXArtifactContent,
+    PPTXArtifactSlide,
+    PPTXBulletsElement,
+    PPTXCalloutElement,
+    PPTXMetricElement,
+    PPTXParagraphElement,
+    PPTXTableElement,
+    PPTXTitleElement,
 )
 from app.models.documents import DocumentFormat
 from app.models.intermediate import DocumentIR, IRBlock, IRSection, SourceLocation
 from app.models.interpretation import DocumentInterpretation, SourceReference
 from app.models.llm import LLMTokenUsage
-from app.models.transformation import TransformationPlan
+from app.models.transformation import PPTXOutputStructure, TransformationPlan
 from app.prompts.artifact import ARTIFACT_PROMPT_VERSION, build_artifact_messages
-from app.services.artifact_renderers import render_docx, render_html, validate_rendered_output
+from app.services.artifact_contracts import (
+    ArtifactContract,
+    ArtifactContractConfigurationError,
+    get_artifact_contract,
+)
 from app.services.interpretation import SourceReferenceResolver
 from app.services.llm import LLMService
 from app.storage.artifacts import ArtifactStore
@@ -41,8 +53,16 @@ class UnsupportedArtifactFormatError(ValueError):
     """A valid target format does not yet have a native renderer."""
 
 
+class UnsupportedArtifactElementError(ValueError):
+    """A plan requests an element that the native renderer cannot produce."""
+
+
 class InvalidArtifactContentError(ValueError):
     """Generated structured content or rendered output failed validation."""
+
+    def __init__(self, message: str, *, diagnostics: dict[str, object] | None = None) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics
 
 
 @dataclass(frozen=True)
@@ -66,8 +86,9 @@ class ArtifactTransformationService:
         user_instructions: str | None = None,
         plan: TransformationPlan | None = None,
     ) -> RenderedArtifact:
-        if target_format not in {DocumentFormat.HTML, DocumentFormat.DOCX}:
-            raise UnsupportedArtifactFormatError
+        # Resolve and verify the complete schema/prompt/writer contract before
+        # invoking the provider or producing a mock artifact.
+        contract = get_artifact_contract(target_format)
         if interpretation.document_id != document_ir.document_id:
             raise InvalidArtifactContentError("The interpretation does not belong to the supplied document.")
         source_fingerprint = InterpretationStore.fingerprint(document_ir.model_dump(mode="json"))
@@ -79,6 +100,8 @@ class ArtifactTransformationService:
             or plan.target_format != target_format
         ):
             raise InvalidArtifactContentError("The transformation plan does not match the source, interpretation, and target format.")
+        if target_format == DocumentFormat.PPTX and plan is not None:
+            _reject_unsupported_pptx_plan_elements(plan)
 
         completion = None
         is_mock = self.llm_service.settings.mock_llm
@@ -87,7 +110,14 @@ class ArtifactTransformationService:
             content = _mock_content(document_ir, target_format)
             warnings.append(MOCK_ARTIFACT_WARNING)
         else:
-            messages = build_artifact_messages(document_ir, interpretation, target_format, user_instructions, plan)
+            messages = build_artifact_messages(
+                document_ir,
+                interpretation,
+                target_format,
+                user_instructions,
+                plan,
+                contract=contract,
+            )
             completion = await self.llm_service.complete(messages)
             is_mock = completion.is_mock
             if is_mock:
@@ -99,18 +129,19 @@ class ArtifactTransformationService:
                     target_format,
                     finish_reason=completion.finish_reason,
                     usage=completion.usage,
+                    contract=contract,
                 )
                 try:
                     validate_artifact_references(content, document_ir)
                 except Exception as exc:
                     raise InvalidArtifactContentError("Generated content cited a source location that does not resolve to the input document.") from exc
+                if target_format == DocumentFormat.PPTX and plan is not None:
+                    _validate_pptx_plan_alignment(content, plan)
 
         try:
-            if target_format == DocumentFormat.HTML:
-                rendered = render_html(content, is_mock=is_mock)
-            else:
-                rendered = render_docx(content, is_mock=is_mock)
-            validate_rendered_output(rendered, target_format.value)
+            provenance = _pptx_provenance(document_ir, interpretation, plan, run_id) if target_format == DocumentFormat.PPTX else {}
+            rendered = contract.writer(content, is_mock, provenance)
+            contract.output_validator(rendered)
         except Exception as exc:
             raise InvalidArtifactContentError("The rendered output failed file validation.") from exc
 
@@ -126,6 +157,7 @@ class ArtifactTransformationService:
             provider=completion.provider if completion is not None else "mock",
             model=completion.model if completion is not None else "mock",
             prompt_version=ARTIFACT_PROMPT_VERSION,
+            artifact_schema_version=contract.schema_version,
             is_mock=is_mock,
             warnings=warnings,
         )
@@ -150,8 +182,12 @@ def _parse_artifact_content(
     *,
     finish_reason: str | None = None,
     usage: LLMTokenUsage | None = None,
+    contract: ArtifactContract | None = None,
 ):
-    model = HTMLArtifactContent if target_format == DocumentFormat.HTML else DOCXArtifactContent
+    contract = contract or get_artifact_contract(target_format)
+    if contract.target_format != target_format:
+        raise ArtifactContractConfigurationError(target_format, "parser schema does not match the requested format")
+    model = contract.schema_model
     normalized_content, was_fenced = _unwrap_json_fence(content)
     try:
         payload = json.loads(normalized_content, parse_constant=_reject_nonstandard_json_constant)
@@ -159,6 +195,14 @@ def _parse_artifact_content(
         try:
             model.model_validate_json(normalized_content)
         except ValidationError as exc:
+            diagnostics = _artifact_validation_diagnostics(
+                exc,
+                target_format=target_format,
+                model_name=model.__name__,
+                prompt_version=ARTIFACT_PROMPT_VERSION,
+                artifact_schema_version=contract.schema_version,
+                json_parsing_succeeded=False,
+            )
             _log_artifact_validation_failure(
                 exc,
                 normalized_content,
@@ -166,8 +210,25 @@ def _parse_artifact_content(
                 finish_reason=finish_reason,
                 usage=usage,
                 json_parsing_succeeded=False,
+                target_format=target_format,
+                model_name=model.__name__,
+                prompt_version=ARTIFACT_PROMPT_VERSION,
+                artifact_schema_version=contract.schema_version,
+                diagnostics=diagnostics,
             )
-            raise InvalidArtifactContentError("The provider response did not contain valid JSON for the target document schema.") from exc
+            raise InvalidArtifactContentError(
+                "The provider response did not contain valid JSON for the target document schema.",
+                diagnostics=diagnostics,
+            ) from exc
+        diagnostics = {
+            "target_format": target_format.value,
+            "schema_model": model.__name__,
+            "prompt_version": ARTIFACT_PROMPT_VERSION,
+            "artifact_schema_version": contract.schema_version,
+            "error_category": "invalid_json",
+            "json_parsing_succeeded": False,
+            "validation_errors": [],
+        }
         logger.error(
             "artifact_content_validation_failed",
             extra={
@@ -175,6 +236,10 @@ def _parse_artifact_content(
                 "failure_reason": "invalid_json",
                 "exception_class": type(parse_error).__name__,
                 "error_category": "invalid_artifact_content",
+                "target_format": target_format.value,
+                "schema_model": model.__name__,
+                "prompt_version": ARTIFACT_PROMPT_VERSION,
+                "artifact_schema_version": contract.schema_version,
                 "json_parsing_failed": True,
                 "json_parsing_succeeded": False,
                 "pydantic_errors": [],
@@ -188,13 +253,24 @@ def _parse_artifact_content(
                 "total_tokens": usage.total_tokens if usage else None,
             },
         )
-        raise InvalidArtifactContentError("The provider response did not contain valid JSON for the target document schema.") from parse_error
+        raise InvalidArtifactContentError(
+            "The provider response did not contain valid JSON for the target document schema.",
+            diagnostics=diagnostics,
+        ) from parse_error
 
     normalized_references = _normalize_nested_reference_section_ids(payload)
     normalized_cells = _normalize_table_cells(payload)
     try:
         validated = model.model_validate(payload)
     except ValidationError as exc:
+        diagnostics = _artifact_validation_diagnostics(
+            exc,
+            target_format=target_format,
+            model_name=model.__name__,
+            prompt_version=ARTIFACT_PROMPT_VERSION,
+            artifact_schema_version=contract.schema_version,
+            json_parsing_succeeded=True,
+        )
         _log_artifact_validation_failure(
             exc,
             normalized_content,
@@ -202,10 +278,18 @@ def _parse_artifact_content(
             finish_reason=finish_reason,
             usage=usage,
             json_parsing_succeeded=True,
+            target_format=target_format,
+            model_name=model.__name__,
+            prompt_version=ARTIFACT_PROMPT_VERSION,
+            artifact_schema_version=contract.schema_version,
+            diagnostics=diagnostics,
             normalized_table_cell_count=normalized_cells,
             normalized_section_reference_count=normalized_references,
         )
-        raise InvalidArtifactContentError("The provider response did not match the target document schema.") from exc
+        raise InvalidArtifactContentError(
+            "The provider response did not match the target document schema.",
+            diagnostics=diagnostics,
+        ) from exc
     if normalized_cells:
         logger.info(
             "artifact_table_cells_normalized",
@@ -225,75 +309,95 @@ def _reject_nonstandard_json_constant(value: str):
 
 def _normalize_table_cells(payload) -> int:
     """Convert scalar JSON table cells to text without coercing nested data."""
-    if not isinstance(payload, dict) or not isinstance(payload.get("sections"), list):
+    if not isinstance(payload, dict):
         return 0
-    normalized = 0
-    for section in payload["sections"]:
-        if not isinstance(section, dict) or not isinstance(section.get("tables"), list):
+    tables: list[dict] = []
+    for section in payload.get("sections", []):
+        if isinstance(section, dict) and isinstance(section.get("tables"), list):
+            tables.extend(table for table in section["tables"] if isinstance(table, dict))
+    for slide in payload.get("slides", []):
+        if not isinstance(slide, dict):
             continue
-        for table in section["tables"]:
-            if not isinstance(table, dict):
+        for element in slide.get("elements", []):
+            if isinstance(element, dict) and element.get("element_type") == "table":
+                table = element.get("content")
+                if isinstance(table, dict):
+                    tables.append(table)
+    normalized = 0
+    for table in tables:
+        for key in ("headers", "rows"):
+            values = table.get(key)
+            if not isinstance(values, list):
                 continue
-            for key in ("headers", "rows"):
-                values = table.get(key)
-                if not isinstance(values, list):
+            groups = values if key == "rows" else [values]
+            for group in groups:
+                if not isinstance(group, list):
                     continue
-                groups = values if key == "rows" else [values]
-                for group in groups:
-                    if not isinstance(group, list):
+                for index, value in enumerate(group):
+                    if isinstance(value, str):
                         continue
-                    for index, value in enumerate(group):
-                        if isinstance(value, str):
-                            continue
-                        if value is None:
-                            group[index] = ""
-                        elif isinstance(value, bool):
-                            group[index] = "true" if value else "false"
-                        elif isinstance(value, int):
-                            group[index] = str(value)
-                        elif isinstance(value, float) and math.isfinite(value):
-                            group[index] = json.dumps(value, allow_nan=False)
-                        else:
-                            # Objects, arrays, and non-finite values are ambiguous;
-                            # leave them untouched so Pydantic rejects them.
-                            continue
-                        normalized += 1
+                    if value is None:
+                        group[index] = ""
+                    elif isinstance(value, bool):
+                        group[index] = "true" if value else "false"
+                    elif isinstance(value, int):
+                        group[index] = str(value)
+                    elif isinstance(value, float) and math.isfinite(value):
+                        group[index] = json.dumps(value, allow_nan=False)
+                    else:
+                        # Objects, arrays, and non-finite values are ambiguous;
+                        # leave them untouched so Pydantic rejects them.
+                        continue
+                    normalized += 1
     return normalized
 
 
 def _normalize_nested_reference_section_ids(payload) -> int:
     """Lift a misplaced reference.section_id out of source_location, losslessly."""
-    if not isinstance(payload, dict) or not isinstance(payload.get("sections"), list):
+    if not isinstance(payload, dict):
         return 0
     normalized = 0
-    for section in payload["sections"]:
-        if not isinstance(section, dict):
+    items: list[dict] = []
+    for section in payload.get("sections", []):
+        if isinstance(section, dict):
+            for collection_name in ("paragraphs", "bullet_points", "metrics", "tables"):
+                collection = section.get(collection_name)
+                if isinstance(collection, list):
+                    items.extend(item for item in collection if isinstance(item, dict))
+    for slide in payload.get("slides", []):
+        if not isinstance(slide, dict):
             continue
-        for collection_name in ("paragraphs", "bullet_points", "metrics", "tables"):
-            collection = section.get(collection_name)
-            if not isinstance(collection, list):
+        title_references = slide.get("title_source_references")
+        if isinstance(title_references, list):
+            items.append({"source_references": title_references})
+        for element in slide.get("elements", []):
+            if not isinstance(element, dict):
                 continue
-            for item in collection:
-                if not isinstance(item, dict) or not isinstance(item.get("source_references"), list):
-                    continue
-                for reference in item["source_references"]:
-                    if not isinstance(reference, dict):
-                        continue
-                    location = reference.get("source_location")
-                    if not isinstance(location, dict) or "section_id" not in location:
-                        continue
-                    nested_section_id = location["section_id"]
-                    if "section_id" not in reference:
-                        reference["section_id"] = nested_section_id
-                        del location["section_id"]
-                        normalized += 1
-                    elif reference["section_id"] == nested_section_id:
-                        # Identical duplicate values are represented once in the
-                        # canonical SourceReference shape.
-                        del location["section_id"]
-                        normalized += 1
-                    # Conflicting values deliberately remain unnormalized and
-                    # fail SourceLocation's extra-forbid validation.
+            for item_key in ("content", "items"):
+                item_value = element.get(item_key)
+                if isinstance(item_value, dict):
+                    items.append(item_value)
+                elif isinstance(item_value, list):
+                    items.extend(item for item in item_value if isinstance(item, dict))
+    for item in items:
+        if not isinstance(item.get("source_references"), list):
+            continue
+        for reference in item["source_references"]:
+            if not isinstance(reference, dict):
+                continue
+            location = reference.get("source_location")
+            if not isinstance(location, dict) or "section_id" not in location:
+                continue
+            nested_section_id = location["section_id"]
+            if "section_id" not in reference:
+                reference["section_id"] = nested_section_id
+                del location["section_id"]
+                normalized += 1
+            elif reference["section_id"] == nested_section_id:
+                del location["section_id"]
+                normalized += 1
+            # Conflicting values deliberately remain unnormalized and fail
+            # SourceLocation's extra-forbid validation.
     return normalized
 
 
@@ -305,10 +409,14 @@ def _log_artifact_validation_failure(
     finish_reason: str | None,
     usage: LLMTokenUsage | None,
     json_parsing_succeeded: bool,
+    target_format: DocumentFormat,
+    model_name: str,
+    prompt_version: str,
+    artifact_schema_version: str,
+    diagnostics: dict[str, object],
     normalized_table_cell_count: int = 0,
     normalized_section_reference_count: int = 0,
 ) -> None:
-    errors = exc.errors(include_url=False, include_input=False)
     logger.error(
         "artifact_content_validation_failed",
         extra={
@@ -316,15 +424,13 @@ def _log_artifact_validation_failure(
             "failure_reason": "schema_mismatch" if json_parsing_succeeded else "invalid_json",
             "exception_class": type(exc).__name__,
             "error_category": "invalid_artifact_content",
+            "target_format": target_format.value,
+            "schema_model": model_name,
+            "prompt_version": prompt_version,
+            "artifact_schema_version": artifact_schema_version,
             "json_parsing_failed": not json_parsing_succeeded,
             "json_parsing_succeeded": json_parsing_succeeded,
-            "pydantic_errors": [
-                {
-                    "location": _safe_error_location(error.get("loc", ())),
-                    "type": error.get("type", "unknown"),
-                }
-                for error in errors
-            ],
+            "pydantic_errors": diagnostics["validation_errors"],
             "content_empty": not content.strip(),
             "content_char_count": len(content),
             "contains_markdown_code_fence": was_fenced,
@@ -337,6 +443,47 @@ def _log_artifact_validation_failure(
             "normalized_section_reference_count": normalized_section_reference_count,
         },
     )
+
+
+def _artifact_validation_diagnostics(
+    exc: ValidationError,
+    *,
+    target_format: DocumentFormat,
+    model_name: str,
+    prompt_version: str,
+    artifact_schema_version: str,
+    json_parsing_succeeded: bool,
+) -> dict[str, object]:
+    errors = exc.errors(include_url=False, include_input=False)
+    return {
+        "target_format": target_format.value,
+        "schema_model": model_name,
+        "prompt_version": prompt_version,
+        "artifact_schema_version": artifact_schema_version,
+        "error_category": "schema_validation",
+        "json_parsing_succeeded": json_parsing_succeeded,
+        "validation_errors": [
+            {
+                "field_path": _safe_error_location(error.get("loc", ())),
+                "error_type": error.get("type", "unknown"),
+                # Keep the original log keys for existing dashboards/tests.
+                "location": _safe_error_location(error.get("loc", ())),
+                "type": error.get("type", "unknown"),
+                "category": _validation_error_category(error.get("type", "unknown")),
+            }
+            for error in errors
+        ],
+    }
+
+
+def _validation_error_category(error_type: str) -> str:
+    if error_type == "missing":
+        return "missing_field"
+    if error_type == "extra_forbidden":
+        return "undeclared_field"
+    if error_type.endswith("_type"):
+        return "incorrect_type"
+    return "constraint_violation"
 
 
 def _unwrap_json_fence(content: str) -> tuple[str, bool]:
@@ -362,6 +509,14 @@ def _safe_error_location(location) -> list[str | int]:
 
 def validate_artifact_references(content, document_ir: DocumentIR) -> None:
     resolver = SourceReferenceResolver(document_ir)
+    if isinstance(content, PPTXArtifactContent):
+        for slide in content.slides:
+            for reference in slide.title_source_references:
+                resolver.validate(reference)
+            for item in _pptx_source_items(slide):
+                for reference in item.source_references:
+                    resolver.validate(reference)
+        return
     for section in content.sections:
         for item in (*section.paragraphs, *section.bullet_points, *section.metrics, *section.tables):
             for reference in item.source_references:
@@ -380,7 +535,193 @@ def _mock_content(document_ir: DocumentIR, target_format: DocumentFormat):
     if target_format == DocumentFormat.HTML:
         html_sections = [_to_html_section(section) for section in sections]
         return HTMLArtifactContent(target_format="html", page_title=title, sections=html_sections)
-    return DOCXArtifactContent(target_format="docx", document_title=title, sections=sections)
+    if target_format == DocumentFormat.DOCX:
+        return DOCXArtifactContent(target_format="docx", document_title=title, sections=sections)
+    if target_format == DocumentFormat.PPTX:
+        return _mock_pptx_content(document_ir)
+    raise UnsupportedArtifactFormatError
+
+
+def _mock_pptx_content(document_ir: DocumentIR) -> PPTXArtifactContent:
+    title = document_ir.title or document_ir.filename
+    section_contents: list[tuple[ArtifactSection, SourceReference | None]] = []
+
+    def visit(source_sections: list[IRSection]) -> None:
+        for source_section in source_sections:
+            artifact_section = _mock_section_from_blocks(
+                source_section.title, source_section, source_section.blocks
+            )
+            if artifact_section is not None:
+                section_reference = None
+                if source_section.source is not None and _has_coordinates(source_section.source):
+                    section_reference = SourceReference(
+                        section_id=source_section.id,
+                        source_location=source_section.source,
+                    )
+                section_contents.append((artifact_section, section_reference))
+            visit(source_section.children)
+
+    visit(document_ir.sections)
+    if document_ir.blocks:
+        loose = _mock_section_from_blocks("Document content", None, document_ir.blocks)
+        if loose is not None:
+            section_contents.append((loose, None))
+
+    slides: list[PPTXArtifactSlide] = []
+    for slide_index, (section, title_reference) in enumerate(section_contents, start=1):
+        slide_id = f"mock-slide-{slide_index}"
+        elements = []
+        for index, paragraph in enumerate(section.paragraphs, start=1):
+            elements.append(PPTXParagraphElement(
+                element_id=f"{slide_id}-paragraph-{index}",
+                element_type="paragraph",
+                content=paragraph,
+            ))
+        if section.bullet_points:
+            elements.append(PPTXBulletsElement(
+                element_id=f"{slide_id}-bullets-1",
+                element_type="bullets",
+                items=section.bullet_points,
+            ))
+        for index, metric in enumerate(section.metrics, start=1):
+            elements.append(PPTXMetricElement(
+                element_id=f"{slide_id}-metric-{index}",
+                element_type="metric",
+                content=metric,
+            ))
+        for index, table in enumerate(section.tables, start=1):
+            elements.append(PPTXTableElement(
+                element_id=f"{slide_id}-table-{index}",
+                element_type="table",
+                content=table,
+            ))
+        if elements:
+            slides.append(PPTXArtifactSlide(
+                slide_id=slide_id,
+                title=section.heading,
+                title_source_references=[title_reference] if title_reference else [],
+                elements=elements,
+            ))
+    if not slides:
+        raise InvalidArtifactContentError("The source IR contains no renderable content.")
+    return PPTXArtifactContent(target_format="pptx", presentation_title=title, slides=slides)
+
+
+def _pptx_source_items(slide: PPTXArtifactSlide):
+    for element in slide.elements:
+        if isinstance(element, (PPTXTitleElement, PPTXParagraphElement, PPTXCalloutElement)):
+            yield element.content
+        elif isinstance(element, PPTXBulletsElement):
+            yield from element.items
+        elif isinstance(element, (PPTXTableElement, PPTXMetricElement)):
+            yield element.content
+
+
+def _reject_unsupported_pptx_plan_elements(plan: TransformationPlan) -> None:
+    structure = plan.output_structure
+    if not isinstance(structure, PPTXOutputStructure):
+        return
+    unsupported = [
+        element.element_type
+        for slide in structure.slides
+        for element in slide.elements
+        if element.element_type in {"chart", "image_placeholder"}
+    ]
+    if unsupported:
+        kinds = ", ".join(sorted(set(unsupported)))
+        raise UnsupportedArtifactElementError(
+            f"PPTX plan element(s) are not supported by the current native writer: {kinds}."
+        )
+
+
+def _validate_pptx_plan_alignment(content: PPTXArtifactContent, plan: TransformationPlan) -> None:
+    structure = plan.output_structure
+    if not isinstance(structure, PPTXOutputStructure):
+        raise InvalidArtifactContentError("The PPTX transformation plan has no PPTX output structure.")
+    planned_slides = {slide.slide_id: slide for slide in structure.slides}
+    output_slides = {slide.slide_id: slide for slide in content.slides}
+    if len(output_slides) != len(content.slides) or set(output_slides) != set(planned_slides):
+        raise InvalidArtifactContentError("Generated PPTX slides do not match the validated plan.")
+    mapping_destinations: dict[str, tuple[str, str]] = {}
+    mappings_by_id = {mapping.mapping_id: mapping for mapping in plan.content_mappings}
+    for slide in structure.slides:
+        for mapping_id in slide.mapping_ids:
+            mapping_destinations[mapping_id] = ("slide", slide.slide_id)
+        for element in slide.elements:
+            for mapping_id in element.mapping_ids:
+                mapping_destinations[mapping_id] = ("slide_element", element.element_id)
+    placements: list[tuple[str, tuple[str, str]]] = []
+    for slide_id, output_slide in output_slides.items():
+        planned_slide = planned_slides[slide_id]
+        if output_slide.title != planned_slide.title:
+            raise InvalidArtifactContentError("Generated PPTX slide titles do not match the validated plan.")
+        if output_slide.purpose is not None and output_slide.purpose != planned_slide.purpose:
+            raise InvalidArtifactContentError("Generated PPTX slide purpose does not match the validated plan.")
+        if output_slide.visual_guidance is not None and output_slide.visual_guidance != planned_slide.visual_guidance:
+            raise InvalidArtifactContentError("Generated PPTX visual guidance does not match the validated plan.")
+        if output_slide.mapping_ids != planned_slide.mapping_ids:
+            raise InvalidArtifactContentError("Generated PPTX slide mappings do not match the validated plan.")
+        slide_references = {
+            _reference_fingerprint(reference)
+            for reference in output_slide.title_source_references
+        }
+        for item in _pptx_source_items(output_slide):
+            slide_references.update(_reference_fingerprint(reference) for reference in item.source_references)
+        for mapping_id in output_slide.mapping_ids:
+            mapping = mappings_by_id.get(mapping_id)
+            if mapping is None or not {
+                _reference_fingerprint(reference) for reference in mapping.source_references
+            }.issubset(slide_references):
+                raise InvalidArtifactContentError("Generated PPTX slide content did not preserve all mapped source references.")
+        planned_elements = {element.element_id: element for element in planned_slide.elements}
+        output_elements = {element.element_id: element for element in output_slide.elements}
+        if len(output_elements) != len(output_slide.elements) or set(output_elements) != set(planned_elements):
+            raise InvalidArtifactContentError("Generated PPTX elements do not match the validated plan.")
+        for element_id, output_element in output_elements.items():
+            planned_element = planned_elements[element_id]
+            if output_element.element_type != planned_element.element_type:
+                raise InvalidArtifactContentError("Generated PPTX element types do not match the validated plan.")
+            element_references = {
+                _reference_fingerprint(reference)
+                for item in _pptx_source_items(PPTXArtifactSlide(
+                    slide_id=output_slide.slide_id,
+                    title=output_slide.title,
+                    elements=[output_element],
+                ))
+                for reference in item.source_references
+            }
+            for mapping_id in output_element.mapping_ids:
+                placements.append((mapping_id, ("slide_element", element_id)))
+                mapping = mappings_by_id.get(mapping_id)
+                if mapping is None or not {
+                    _reference_fingerprint(reference) for reference in mapping.source_references
+                }.issubset(element_references):
+                    raise InvalidArtifactContentError("Generated PPTX element did not preserve all mapped source references.")
+    for slide in content.slides:
+        for mapping_id in slide.mapping_ids:
+            placements.append((mapping_id, ("slide", slide.slide_id)))
+    seen_ids = [mapping_id for mapping_id, _ in placements]
+    if len(seen_ids) != len(set(seen_ids)):
+        raise InvalidArtifactContentError("Generated PPTX content repeats a plan mapping ID.")
+    if dict(placements) != mapping_destinations or set(seen_ids) != set(mapping_destinations):
+        raise InvalidArtifactContentError("Generated PPTX mapping placements do not match the validated plan.")
+
+
+def _reference_fingerprint(reference: SourceReference) -> str:
+    return json.dumps(reference.model_dump(mode="json", exclude_none=True), sort_keys=True, separators=(",", ":"))
+
+
+def _pptx_provenance(document_ir, interpretation, plan, run_id) -> dict[str, object]:
+    return {
+        "run_id": str(run_id),
+        "document_id": document_ir.document_id,
+        "source_format": document_ir.source_format.value,
+        "source_provenance": [item.model_dump(mode="json", exclude_none=True) for item in document_ir.provenance],
+        "interpretation_id": str(interpretation.interpretation_id),
+        "interpretation_provenance": interpretation.provenance.model_dump(mode="json", exclude_none=True),
+        "plan_id": str(plan.plan_id) if plan else None,
+        "plan_provenance": plan.provenance.model_dump(mode="json", exclude_none=True) if plan else None,
+    }
 
 
 def _to_html_section(section: ArtifactSection) -> HTMLArtifactSection:

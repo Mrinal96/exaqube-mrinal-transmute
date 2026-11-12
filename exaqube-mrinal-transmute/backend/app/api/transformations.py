@@ -17,10 +17,15 @@ from app.models.documents import DocumentFormat
 from app.services.artifact_transformation import (
     ArtifactTransformationService,
     InvalidArtifactContentError,
+    UnsupportedArtifactElementError,
     UnsupportedArtifactFormatError,
 )
 from app.services.container import get_interpretation_service
 from app.services.interpretation import InterpretationService
+from app.services.artifact_contracts import (
+    ArtifactContractConfigurationError,
+    SUPPORTED_ARTIFACT_FORMATS,
+)
 from app.storage.artifacts import ArtifactStore
 from app.storage.interpretations import InterpretationStore
 from app.storage.operations import OperationStore
@@ -28,10 +33,11 @@ from app.storage.operations import OperationStore
 
 router = APIRouter(prefix="/documents", tags=["transformations"])
 logger = logging.getLogger(__name__)
-SUPPORTED_RENDERERS = {DocumentFormat.HTML, DocumentFormat.DOCX}
+SUPPORTED_RENDERERS = SUPPORTED_ARTIFACT_FORMATS
 MEDIA_TYPES = {
     DocumentFormat.HTML: "text/html; charset=utf-8",
     DocumentFormat.DOCX: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    DocumentFormat.PPTX: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
 
 
@@ -55,7 +61,7 @@ async def create_transformation(
 ) -> ArtifactOperationResponse:
     document_id = _document_uuid(document_id)
     if body.target_format not in SUPPORTED_RENDERERS:
-        raise APIError(422, "target_renderer_unavailable", "A native renderer is currently available only for HTML and DOCX.")
+        raise APIError(422, "target_renderer_unavailable", "A native renderer is currently available for HTML, DOCX, and PPTX.")
     document_ir = require_document(settings.storage_root, document_id)
     store = InterpretationStore(settings.storage_root)
     if body.interpretation_id is not None:
@@ -105,9 +111,30 @@ async def create_transformation(
             except Exception:
                 logger.exception("artifact_operation_record_write_failed")
             if isinstance(exc, UnsupportedArtifactFormatError):
-                raise APIError(422, "target_renderer_unavailable", "A native renderer is currently available only for HTML and DOCX.") from exc
+                raise APIError(422, "target_renderer_unavailable", "A native renderer is currently available for HTML, DOCX, and PPTX.") from exc
+            if isinstance(exc, UnsupportedArtifactElementError):
+                raise APIError(422, "unsupported_artifact_element", str(exc)) from exc
+            if isinstance(exc, ArtifactContractConfigurationError):
+                logger.error(
+                    "artifact_contract_preflight_failed",
+                    extra={
+                        "target_format": exc.target_format.value,
+                        "error_code": exc.code,
+                        "failure_reason": exc.reason,
+                    },
+                )
+                raise APIError(
+                    500,
+                    exc.code,
+                    "Artifact generation is unavailable because its target contract is not correctly configured.",
+                ) from exc
             if isinstance(exc, InvalidArtifactContentError):
-                raise APIError(502, "invalid_artifact_output", str(exc)) from exc
+                raise APIError(
+                    502,
+                    "invalid_artifact_output",
+                    str(exc),
+                    details=exc.diagnostics,
+                ) from exc
             raise
 
         usage, cost = usage_and_cost(settings, result.usage)

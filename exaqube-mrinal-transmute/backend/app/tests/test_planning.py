@@ -1,6 +1,7 @@
 """Validation, target planning, mock safety, and persistence tests for M2.3."""
 
 import asyncio
+import hashlib
 import json
 import logging
 from uuid import UUID
@@ -10,6 +11,7 @@ from pydantic import ValidationError
 
 from app.config import Settings
 from app.models.documents import DocumentFormat
+from app.models.artifacts import ArtifactText, PPTXArtifactContent, PPTXArtifactSlide, PPTXParagraphElement
 from app.models.intermediate import DocumentIR, IRBlock, IRSection, ProvenanceRecord, SourceLocation
 from app.models.interpretation import (
     DocumentInterpretation,
@@ -22,10 +24,12 @@ from app.models.llm import LLMCompletionResult, LLMErrorCategory, LLMTokenUsage
 from app.models.transformation import OmittedContent, TransformationPlanDraft
 from app.prompts.transformation import (
     PROMPT_VERSION,
+    PPTX_PROMPT_VERSION,
     SYSTEM_PROMPT,
     TARGET_GUIDANCE,
     _target_plan_schema,
     build_transformation_messages,
+    prompt_version_for,
     semantic_source_items,
 )
 from app.services.llm import LLMService
@@ -161,7 +165,7 @@ def make_draft(target: DocumentFormat, *, with_fact: bool = True, bad_reference:
             "presentation_title": "Financial Summary",
             "slides": [{
                 "slide_id": "slide-1", "title": "Revenue", "purpose": "Report the result.",
-                "mapping_ids": mapping_ids, "elements": [],
+                "elements": [],
             }],
         }
         mapping["destination"] = {"target_type": "slide", "target_id": "slide-1"}
@@ -240,8 +244,55 @@ def test_valid_target_aware_plan_parses_all_five_formats(tmp_path, target):
         assert stored.content_mappings[0].destination == plan.content_mappings[0].destination
 
 
+@pytest.mark.parametrize("target", [
+    DocumentFormat.XLSX,
+    DocumentFormat.MMD,
+    DocumentFormat.HTML,
+])
+def test_destination_mismatch_to_another_declared_location_is_rejected(tmp_path, caplog, target):
+    ir = make_ir()
+    interpretation = make_interpretation(ir)
+    payload = make_draft(target)
+    mapping = payload["content_mappings"][0]
+
+    if target is DocumentFormat.PPTX:
+        payload["output_structure"]["slides"].append({
+            "slide_id": "slide-2", "title": "Other", "purpose": "Other location.",
+            "mapping_ids": [], "elements": [],
+        })
+        mapping["destination"] = {"target_type": "slide", "target_id": "slide-2"}
+    elif target is DocumentFormat.XLSX:
+        payload["output_structure"]["worksheets"][0]["tables"].append({
+            "table_id": "table-2", "name": "Other", "purpose": "Other location.",
+            "mapping_ids": [],
+            "columns": [{"column_id": "column-2", "name": "Value", "data_type": "number"}],
+        })
+        mapping["destination"] = {"target_type": "table", "target_id": "table-2"}
+    elif target is DocumentFormat.MMD:
+        payload["output_structure"]["nodes"].append({
+            "node_id": "node-2", "label": "Other", "role": "context", "mapping_ids": [],
+        })
+        mapping["destination"] = {"target_type": "diagram_node", "target_id": "node-2"}
+    else:
+        payload["output_structure"]["sections"].append({
+            "section_id": "html-section-2", "heading": "Other", "semantic_element": "section",
+            "purpose": "Other location.", "mapping_ids": [], "components": [],
+        })
+        mapping["destination"] = {"target_type": "html_section", "target_id": "html-section-2"}
+
+    service = PlanningService(
+        LLMService(settings(), client=StaticLLMClient(content=json.dumps(payload))), tmp_path
+    )
+    with pytest.raises(PlanValidationError, match="destination does not match"):
+        run(service.create_plan(ir, interpretation, target))
+
+    record = next(item for item in caplog.records if item.message == "transformation_plan_validation_failed")
+    assert record.validation_category == "destination_mismatch"
+    assert record.validation_path == ["content_mappings", 0, "destination"]
+
+
 def test_docx_schema_uses_single_mapping_owned_destination():
-    assert PROMPT_VERSION == "transformation_v6"
+    assert PROMPT_VERSION == "transformation_v9"
     schema = _target_plan_schema(DocumentFormat.DOCX)
     mapping_schema = schema["$defs"]["ContentMapping"]
     assert "destination" in mapping_schema["required"]
@@ -252,6 +303,184 @@ def test_docx_schema_uses_single_mapping_owned_destination():
     assert "Each content_mapping must include exactly one destination object" in prompt
     assert "the content mapping is the sole authoritative placement" in prompt.lower()
     assert "must not contain mapping_ids" in prompt
+
+
+@pytest.mark.parametrize(
+    ("target", "rule_fragment"),
+    [
+    (DocumentFormat.PPTX, "exact declared slide_id"),
+        (DocumentFormat.XLSX, "copy exactly that object's worksheet_id, table_id, or column_id"),
+        (DocumentFormat.MMD, "exact node_id"),
+        (DocumentFormat.HTML, "exact section_id"),
+    ],
+)
+def test_target_prompts_define_destination_to_exact_structure_id(target, rule_fragment):
+    ir = make_ir()
+    prompt = build_transformation_messages(ir, make_interpretation(ir), target)[0].content
+
+    assert PROMPT_VERSION == "transformation_v9"
+    assert rule_fragment in prompt
+    assert "must be an exact pointer to that same location" in prompt
+    assert "A different but otherwise valid ID is not a valid destination" in prompt
+
+
+def test_pptx_provider_schema_uses_destination_as_only_placement_source():
+    schema = _target_plan_schema(DocumentFormat.PPTX)
+    serialized = json.dumps(schema)
+    assert "PPTXPlanningOutputStructure" in serialized
+    assert "PPTXPlanningSlideDraft" in serialized
+    assert "PPTXPlanningElementDraft" in serialized
+    assert "mapping_ids" not in schema["$defs"]["PPTXPlanningSlideDraft"]["properties"]
+    assert "mapping_ids" not in schema["$defs"]["PPTXPlanningElementDraft"]["properties"]
+    assert schema["$defs"]["ContentMapping"]["properties"]["destination"]
+
+    ir = make_ir()
+    prompt = build_transformation_messages(ir, make_interpretation(ir), DocumentFormat.PPTX)
+    assert prompt_version_for(DocumentFormat.PPTX) == PPTX_PROMPT_VERSION == "transformation_v10"
+    assert "planning_schema_version" in prompt[1].content
+    assert "must not contain mapping_ids" in prompt[0].content
+    assert "mutually exclusive destinations" in prompt[0].content
+
+    legacy_payload = make_draft(DocumentFormat.PPTX)
+    legacy_payload["output_structure"]["slides"][0]["mapping_ids"] = ["mapping-fact-1"]
+    with pytest.raises(InvalidPlanResponseError):
+        _parse_plan_draft(json.dumps(legacy_payload), DocumentFormat.PPTX)
+
+
+def _create_pptx_plan(tmp_path, payload):
+    ir = make_ir()
+    interpretation = make_interpretation(ir)
+    client = StaticLLMClient(content=json.dumps(payload))
+    plan = run(PlanningService(LLMService(settings(), client=client), tmp_path).create_plan(
+        ir, interpretation, DocumentFormat.PPTX
+    ))
+    return ir, interpretation, plan
+
+
+def test_pptx_slide_destination_materializes_mapping_ids(tmp_path):
+    payload = make_draft(DocumentFormat.PPTX)
+    payload["content_mappings"][0]["source_references"] = [reference_json()]
+
+    _, _, plan = _create_pptx_plan(tmp_path, payload)
+
+    assert plan.provenance.prompt_version == PPTX_PROMPT_VERSION
+    assert plan.output_structure.slides[0].mapping_ids == ["mapping-fact-1"]
+    assert plan.content_mappings[0].destination.target_type == "slide"
+    assert plan.content_mappings[0].destination.target_id == "slide-1"
+    assert plan.content_mappings[0].source_references[0].block_id == BLOCK_ID
+
+
+def test_pptx_planning_schema_and_prompt_versions_invalidate_old_fingerprint(tmp_path):
+    ir = make_ir()
+    interpretation = make_interpretation(ir)
+    service, _ = make_service(tmp_path, interpretation, response=make_draft(DocumentFormat.PPTX))
+    plan = run(service.create_plan(ir, interpretation, DocumentFormat.PPTX))
+
+    source_ir_fingerprint = service.store.fingerprint(ir.model_dump(mode="json"))
+    interpretation_fingerprint = service.store.fingerprint(interpretation.model_dump(mode="json"))
+    legacy_fingerprint = service.store.fingerprint({
+        "document_id": ir.document_id,
+        "source_ir_fingerprint": source_ir_fingerprint,
+        "interpretation_id": str(interpretation.interpretation_id),
+        "interpretation_fingerprint": interpretation_fingerprint,
+        "target_format": DocumentFormat.PPTX.value,
+        "user_instructions": None,
+        "prompt_version": PROMPT_VERSION,
+        "provider_identity": service._provider_identity(interpretation),
+    })
+
+    assert plan.provenance.prompt_version == PPTX_PROMPT_VERSION
+    assert plan.metadata.input_fingerprint != legacy_fingerprint
+
+
+def test_pptx_nested_element_destination_materializes_for_existing_writer(tmp_path):
+    payload = make_draft(DocumentFormat.PPTX)
+    payload["output_structure"]["slides"][0]["elements"] = [{
+        "element_id": "element-revenue",
+        "element_type": "paragraph",
+        "purpose": "Present the reported revenue.",
+    }]
+    payload["content_mappings"][0]["destination"] = {
+        "target_type": "slide_element", "target_id": "element-revenue",
+    }
+    ir, _, plan = _create_pptx_plan(tmp_path, payload)
+
+    assert plan.output_structure.slides[0].mapping_ids == []
+    assert plan.output_structure.slides[0].elements[0].mapping_ids == ["mapping-fact-1"]
+    assert plan.content_mappings[0].destination.target_id == "element-revenue"
+
+    content = PPTXArtifactContent(
+        target_format="pptx",
+        presentation_title="Financial Summary",
+        slides=[PPTXArtifactSlide(
+            slide_id="slide-1",
+            title="Revenue",
+            elements=[PPTXParagraphElement(
+                element_id="element-revenue",
+                element_type="paragraph",
+                mapping_ids=["mapping-fact-1"],
+                content=ArtifactText(text="Revenue was $500,000 in Q3.", source_references=[reference_json()]),
+            )],
+        )],
+    )
+    from app.services.artifact_transformation import _validate_pptx_plan_alignment
+    from app.services.pptx_writer import render_pptx, validate_pptx_output
+
+    _validate_pptx_plan_alignment(content, plan)
+    artifact = render_pptx(content, is_mock=False, provenance={"document_id": ir.document_id})
+    validate_pptx_output(artifact)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "category"),
+    [
+        (lambda payload: payload["content_mappings"][0]["destination"].update(target_id="missing-slide"), "unknown_pptx_destination"),
+        (lambda payload: payload["content_mappings"][0]["destination"].update(target_type="worksheet"), "invalid_pptx_destination_type"),
+        (lambda payload: payload["output_structure"]["slides"].append(dict(payload["output_structure"]["slides"][0])), "duplicate_destination_id"),
+        (lambda payload: payload["output_structure"]["slides"][0]["elements"].extend([
+            {"element_id": "element-duplicate", "element_type": "paragraph", "purpose": "First."},
+            {"element_id": "element-duplicate", "element_type": "table", "purpose": "Second."},
+        ]), "duplicate_destination_id"),
+    ],
+    ids=["unknown-id", "wrong-target-type", "duplicate-slide-id", "duplicate-element-id"],
+)
+def test_pptx_invalid_destinations_and_output_ids_are_rejected(tmp_path, caplog, mutate, category):
+    payload = make_draft(DocumentFormat.PPTX)
+    mutate(payload)
+    ir = make_ir()
+    interpretation = make_interpretation(ir)
+    service = PlanningService(
+        LLMService(settings(), client=StaticLLMClient(content=json.dumps(payload))), tmp_path
+    )
+
+    with pytest.raises(PlanValidationError):
+        run(service.create_plan(ir, interpretation, DocumentFormat.PPTX))
+
+    record = next(item for item in caplog.records if item.message == "transformation_plan_validation_failed")
+    assert record.validation_category == category
+
+
+def test_pptx_duplicate_mapping_ids_and_missing_semantic_mappings_are_rejected(tmp_path, caplog):
+    ir = make_ir()
+    interpretation = make_interpretation(ir)
+    duplicate = make_draft(DocumentFormat.PPTX)
+    duplicate["content_mappings"].append(dict(duplicate["content_mappings"][0]))
+    service = PlanningService(
+        LLMService(settings(), client=StaticLLMClient(content=json.dumps(duplicate))), tmp_path
+    )
+    with pytest.raises(PlanValidationError, match="mapping IDs must be unique"):
+        run(service.create_plan(ir, interpretation, DocumentFormat.PPTX))
+    record = next(item for item in caplog.records if item.message == "transformation_plan_validation_failed")
+    assert record.validation_category == "duplicate_mapping_id"
+
+    missing = make_draft(DocumentFormat.PPTX)
+    missing["content_mappings"] = []
+    missing["output_structure"]["slides"][0]["elements"] = []
+    service = PlanningService(
+        LLMService(settings(), client=StaticLLMClient(content=json.dumps(missing))), tmp_path
+    )
+    with pytest.raises(PlanAccountingError, match="must be mapped or omitted"):
+        run(service.create_plan(ir, interpretation, DocumentFormat.PPTX))
 
 
 def test_docx_plan_preserves_destinations_for_sections_and_table_elements(tmp_path):
@@ -377,7 +606,6 @@ def test_plan_can_map_an_original_ir_block_directly(tmp_path):
     ir = make_ir()
     interpretation = make_interpretation(ir)
     payload = make_draft(DocumentFormat.PPTX)
-    payload["output_structure"]["slides"][0]["mapping_ids"].append("mapping-source-block")
     payload["content_mappings"].append({
         "mapping_id": "mapping-source-block",
         "source_item_type": "ir_block",
@@ -419,6 +647,48 @@ def test_invented_source_id_is_rejected(tmp_path):
     service = PlanningService(LLMService(settings(), client=client), tmp_path)
     with pytest.raises(PlanValidationError):
         run(service.create_plan(ir, interpretation, DocumentFormat.PPTX))
+
+
+def test_pptx_plan_rejects_ir_block_id_not_in_source_ir(tmp_path, caplog):
+    ir = make_ir()
+    interpretation = make_interpretation(ir)
+    payload = make_draft(DocumentFormat.PPTX)
+    payload["content_mappings"][0].update({
+        "source_item_type": "ir_block",
+        "source_item_id": "invented-pptx-block",
+        "source_references": [{
+            "block_id": "invented-pptx-block",
+            "source_location": SOURCE_LOCATION.model_dump(mode="json"),
+        }],
+    })
+    client = StaticLLMClient(content=json.dumps(payload))
+    service = PlanningService(LLMService(settings(), client=client), tmp_path)
+
+    with caplog.at_level(logging.WARNING, logger="app.services.planning"):
+        with pytest.raises(PlanValidationError, match="IR block absent"):
+            run(service.create_plan(ir, interpretation, DocumentFormat.PPTX))
+
+    record = next(
+        item for item in caplog.records
+        if item.message == "transformation_plan_validation_failed"
+    )
+    assert record.validation_category == "unknown_ir_block"
+    assert record.validation_path == ["content_mappings", "source_item_id"]
+    assert "invented-pptx-block" not in caplog.text
+
+
+def test_planning_prompt_exposes_exact_ir_block_allowlist(tmp_path):
+    ir = make_ir()
+    interpretation = make_interpretation(ir)
+    client = StaticLLMClient(content=json.dumps(make_draft(DocumentFormat.PPTX)))
+    service = PlanningService(LLMService(settings(), client=client), tmp_path)
+    run(service.create_plan(ir, interpretation, DocumentFormat.PPTX))
+
+    system_prompt, user_message = client.messages[0][0], client.messages[0][1]
+    request_data = json.loads(user_message.content)
+    assert "copy its exact ID from the supplied valid_ir_block_ids allowlist" in system_prompt.content
+    assert request_data["valid_ir_block_ids"] == [BLOCK_ID]
+    assert "synthesize IR block IDs" in system_prompt.content
 
 
 def test_unresolved_reference_in_interpretation_is_rejected_even_if_plan_does_not_cite_it(tmp_path):
@@ -812,7 +1082,7 @@ def test_plan_provenance_usage_and_source_objects_are_preserved(tmp_path):
     ))
     assert plan.provenance.provider == "test-provider"
     assert plan.provenance.model == "served-planning-model"
-    assert plan.provenance.prompt_version == PROMPT_VERSION
+    assert plan.provenance.prompt_version == prompt_version_for(DocumentFormat.PPTX)
     assert plan.provenance.created_at.tzinfo is not None
     assert plan.provenance.token_usage.total_tokens == 120
     assert plan.provenance.is_mock is False

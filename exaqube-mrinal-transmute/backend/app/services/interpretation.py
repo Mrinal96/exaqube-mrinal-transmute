@@ -71,9 +71,15 @@ class InterpretationService:
         self,
         document_ir: DocumentIR,
         user_instructions: str | None = None,
+        *,
+        max_completion_tokens: int | None = None,
     ) -> DocumentInterpretation:
         """Interpret and persist IR without modifying the source representation."""
-        result = await self.interpret_with_status(document_ir, user_instructions)
+        result = await self.interpret_with_status(
+            document_ir,
+            user_instructions,
+            max_completion_tokens=max_completion_tokens,
+        )
         return result.interpretation
 
     async def interpret_with_status(
@@ -82,17 +88,21 @@ class InterpretationService:
         user_instructions: str | None = None,
         *,
         idempotency_key: str | None = None,
+        max_completion_tokens: int | None = None,
     ) -> StoredInterpretation:
         """Interpret once per input fingerprint and report whether storage was reused."""
         source_fingerprint = self.store.fingerprint(document_ir.model_dump(mode="json"))
         instruction_fingerprint = hashlib.sha256((user_instructions or "").encode("utf-8")).hexdigest()
         identity = self._provider_identity()
-        input_fingerprint = self.store.fingerprint({
+        fingerprint_payload = {
             "source_ir_fingerprint": source_fingerprint,
             "instructions": user_instructions,
             "prompt_version": PROMPT_VERSION,
             "provider_identity": identity,
-        })
+        }
+        if max_completion_tokens is not None:
+            fingerprint_payload["max_completion_tokens"] = max_completion_tokens
+        input_fingerprint = self.store.fingerprint(fingerprint_payload)
 
         if idempotency_key is not None:
             await asyncio.to_thread(
@@ -106,7 +116,13 @@ class InterpretationService:
                 return StoredInterpretation(cached, True)
 
             messages = build_interpretation_messages(document_ir, user_instructions)
-            completion = await self.llm_service.complete(messages)
+            if max_completion_tokens is None:
+                completion = await self.llm_service.complete(messages)
+            else:
+                completion = await self.llm_service.complete(
+                    messages,
+                    max_completion_tokens=max_completion_tokens,
+                )
             phase = "semantic_validation"
             try:
                 if completion.is_mock:

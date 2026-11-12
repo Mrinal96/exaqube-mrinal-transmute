@@ -229,3 +229,168 @@ textarea:focus-visible,
     transform: translateY(0);
   }
 }
+
+/* ── Node Dropdown Action Menu ── */
+
+.node-dropdown-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  min-width: 195px;
+  background: #14161d;
+  border: 1px solid #2d303a;
+  border-radius: 8px;
+  padding: 5px;
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.7);
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.node-dropdown-item {
+  height: 29px;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px;
+  background: transparent;
+  border: 0;
+  border-radius: 5px;
+  color: #c4c6ce;
+  font-size: 10px;
+  font-weight: 500;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s ease, color 0.12s ease;
+  white-space: nowrap;
+}
+
+.node-dropdown-item:hover {
+  background: #20232d;
+  color: #f1f2f6;
+}
+
+.node-dropdown-item.danger {
+  color: #e0847d;
+}
+
+.node-dropdown-item.danger:hover {
+  background: rgba(224, 132, 125, 0.14);
+  color: #ff9d96;
+}
+
+.node-dropdown-divider {
+  height: 1px;
+  background: #252831;
+  margin: 3px 0;
+}
+
+.node-format-submenu {
+  margin: 2px 4px 4px 4px;
+  padding: 4px;
+  background: #0f1116;
+  border: 1px solid #272a33;
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.node-format-option {
+  height: 24px;
+  display: flex;
+  align-items: center;
+  padding: 0 6px;
+  border-radius: 4px;
+  background: transparent;
+  color: #b0b4bd;
+  font-size: 9px;
+  cursor: pointer;
+  transition: background 0.1s ease;
+}
+
+.node-format-option:hover {
+  background: #1c1e27;
+  color: #fff;
+}
+
+.node-format-option.active {
+  background: #242236;
+  color: #cbbfff;
+}
+
+/* ── Node Instruction Interactive Enhancement ── */
+
+.node-instruction.clickable {
+  cursor: pointer;
+  border-radius: 5px;
+  padding: 0 6px;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.node-instruction.clickable:hover {
+  background: #1f1d2c;
+  color: #d1c5ff;
+}
+
+.instruction-edit-icon {
+  opacity: 0;
+  color: #9d8df2;
+  transition: opacity 0.15s ease;
+}
+
+.node-instruction.clickable:hover .instruction-edit-icon {
+  opacity: 0.85;
+}
+
+.node-instruction-editing {
+  height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 2px;
+}
+
+.node-instruction-input {
+  flex: 1;
+  height: 25px;
+  min-width: 0;
+  background: #101217;
+  border: 1px solid #4a4563;
+  border-radius: 4px;
+  padding: 0 7px;
+  font-size: 9px;
+  color: #ececf1;
+  outline: none;
+}
+
+.node-instruction-input:focus {
+  border-color: #8470e9;
+  box-shadow: 0 0 0 1px #8470e955;
+}
+
+.instruction-btn {
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  display: grid;
+  place-items: center;
+}
+
+.instruction-btn.save-btn {
+  color: #68c49c;
+}
+
+.instruction-btn.save-btn:hover {
+  background: rgba(104, 196, 156, 0.18);
+}
+
+.instruction-btn.cancel-btn {
+  color: #9da1ac;
+}
+
+.instruction-btn.cancel-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+}

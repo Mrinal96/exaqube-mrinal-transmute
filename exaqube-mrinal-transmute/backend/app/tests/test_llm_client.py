@@ -134,6 +134,69 @@ def test_groq_gpt_oss_request_uses_supported_completion_budget_and_low_reasoning
     assert "max_tokens" not in captured["body"]
 
 
+def test_groq_gpt_oss_20b_workflow_budget_is_sent_and_kept_within_tpm_headroom():
+    captured = {}
+    messages = [
+        LLMRequestMessage(role="system", content="Interpret the source faithfully."),
+        LLMRequestMessage(role="user", content="A compact financial source."),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}]},
+        )
+
+    client = OpenAICompatibleClient(
+        base_url="https://api.groq.com/openai/v1",
+        model="openai/gpt-oss-20b",
+        transport=httpx.MockTransport(handler),
+    )
+    service = LLMService(
+        make_settings(model="openai/gpt-oss-20b"),
+        client=client,
+    )
+    run(_service_complete_with_budget_and_close(service, messages, 4096))
+
+    estimated_prompt_tokens = (sum(len(message.content) for message in messages) + 3) // 4
+    assert captured["body"]["max_completion_tokens"] == 4096
+    assert "max_tokens" not in captured["body"]
+    assert (
+        estimated_prompt_tokens
+        + captured["body"]["max_completion_tokens"]
+        + client.GROQ_PROMPT_ESTIMATE_SAFETY_TOKENS
+        <= client.GROQ_TPM_LIMIT
+    )
+
+
+def test_groq_gpt_oss_20b_workflow_budget_clamps_for_large_prompts():
+    captured = {}
+    long_messages = [LLMRequestMessage(role="user", content="x" * 20_000)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}]},
+        )
+
+    client = OpenAICompatibleClient(
+        base_url="https://api.groq.com/openai/v1",
+        model="openai/gpt-oss-20b",
+        transport=httpx.MockTransport(handler),
+    )
+    service = LLMService(make_settings(model="openai/gpt-oss-20b"), client=client)
+    run(_service_complete_with_budget_and_close(service, long_messages, 4096))
+
+    estimated_prompt_tokens = (len(long_messages[0].content) + 3) // 4
+    assert captured["body"]["max_completion_tokens"] == (
+        client.GROQ_TPM_LIMIT
+        - estimated_prompt_tokens
+        - client.GROQ_PROMPT_ESTIMATE_SAFETY_TOKENS
+    )
+
+
 def test_length_finish_reason_is_classified_as_truncated_before_json_validation(caplog):
     def handler(_: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -960,5 +1023,12 @@ async def _complete_and_close(client: OpenAICompatibleClient):
 async def _service_complete_and_close(service: LLMService):
     try:
         return await service.complete(MESSAGES)
+    finally:
+        await service.aclose()
+
+
+async def _service_complete_with_budget_and_close(service: LLMService, messages, budget: int):
+    try:
+        return await service.complete(messages, max_completion_tokens=budget)
     finally:
         await service.aclose()
