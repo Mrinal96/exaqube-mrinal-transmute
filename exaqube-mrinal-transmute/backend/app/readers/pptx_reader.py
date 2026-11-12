@@ -56,7 +56,11 @@ def read_pptx(content: bytes, document_id: str, filename: str) -> DocumentIR:
                         chart_data.append({"series": series.name, "categories": categories, "values": list(series.values)})
                 section.blocks.append(make_block(
                     f"slide-{slide_number}-chart-{shape_index}", "chart", source=shape_location,
-                    attributes={"chart_type": str(chart.chart_type), "series": chart_data},
+                    attributes={
+                        "title": chart.chart_title.text_frame.text.strip() if chart.has_title else "",
+                        "chart_type": str(chart.chart_type),
+                        "series": chart_data,
+                    },
                 ))
         try:
             notes_frame = slide.notes_slide.notes_text_frame

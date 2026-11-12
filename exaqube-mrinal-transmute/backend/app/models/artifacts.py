@@ -1,15 +1,16 @@
 """Validated target document content and persisted artifact metadata."""
 
 from datetime import datetime, timezone
+import math
 from typing import Annotated, Literal, Union
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, field_validator, model_validator
 
 from app.models.documents import DocumentFormat
 from app.models.interpretation import MetricValue, SourceReference
 
-ARTIFACT_SCHEMA_VERSION = "1.0"
+ARTIFACT_SCHEMA_VERSION = "1.1"
 
 
 class ArtifactText(BaseModel):
@@ -133,6 +134,69 @@ class PPTXMetricElement(BaseModel):
     content: ArtifactMetric
 
 
+class PPTXChartSeries(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
+    values: list[StrictInt | StrictFloat | None] = Field(min_length=1)
+
+    @field_validator("values")
+    @classmethod
+    def values_must_be_finite(cls, values: list[int | float | None]) -> list[int | float | None]:
+        if any(isinstance(value, float) and not math.isfinite(value) for value in values):
+            raise ValueError("Chart values must be finite numbers or null.")
+        return values
+
+    @model_validator(mode="after")
+    def series_has_numeric_value(self) -> "PPTXChartSeries":
+        if not self.name.strip():
+            raise ValueError("A chart series name must not be blank.")
+        if not any(value is not None for value in self.values):
+            raise ValueError("A chart series must contain at least one numeric value.")
+        return self
+
+
+class PPTXChartContent(BaseModel):
+    """Editable chart data and citations carried into the native PowerPoint chart."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=1)
+    chart_type: Literal["bar", "line", "pie"]
+    categories: list[str] = Field(min_length=1)
+    series: list[PPTXChartSeries] = Field(min_length=1)
+    source_references: list[SourceReference] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def chart_data_is_consistent(self) -> "PPTXChartContent":
+        if not self.title.strip():
+            raise ValueError("A chart title must not be blank.")
+        if any(not category.strip() for category in self.categories):
+            raise ValueError("Chart categories must not be blank.")
+        if len(set(self.categories)) != len(self.categories):
+            raise ValueError("Chart categories must be unique.")
+        if any(len(item.values) != len(self.categories) for item in self.series):
+            raise ValueError("Each chart series must have one value per category.")
+        if self.chart_type == "pie":
+            if len(self.series) != 1:
+                raise ValueError("A pie chart must contain exactly one data series.")
+            values = self.series[0].values
+            if any(value is not None and value < 0 for value in values):
+                raise ValueError("Pie chart values must not be negative.")
+            if not any(value is not None and value > 0 for value in values):
+                raise ValueError("A pie chart must contain at least one positive value.")
+        return self
+
+
+class PPTXChartElement(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    element_id: str = Field(min_length=1)
+    element_type: Literal["chart"]
+    mapping_ids: list[str] = Field(default_factory=list)
+    content: PPTXChartContent
+
+
 PPTXArtifactElement = Annotated[
     Union[
         PPTXTitleElement,
@@ -141,6 +205,7 @@ PPTXArtifactElement = Annotated[
         PPTXBulletsElement,
         PPTXTableElement,
         PPTXMetricElement,
+        PPTXChartElement,
     ],
     Field(discriminator="element_type"),
 ]

@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import pytest
 from pptx import Presentation
+from pptx.enum.chart import XL_CHART_TYPE
 from pydantic import ValidationError
 
 from app.models.artifacts import (
@@ -14,6 +15,8 @@ from app.models.artifacts import (
     ArtifactText,
     PPTXArtifactContent,
     PPTXBulletsElement,
+    PPTXChartContent,
+    PPTXChartElement,
     PPTXMetricElement,
     PPTXParagraphElement,
     PPTXTableElement,
@@ -208,8 +211,9 @@ def test_validator_rejects_empty_or_malformed_pptx(output):
         validate_pptx_output(output)
 
 
-def test_schema_rejects_chart_and_image_placeholder_elements():
-    payload = {
+def test_schema_accepts_typed_native_chart_and_rejects_image_placeholder():
+    reference = _reference()
+    chart_payload = {
         "target_format": "pptx",
         "presentation_title": "Quarterly Results",
         "slides": [{
@@ -218,12 +222,139 @@ def test_schema_rejects_chart_and_image_placeholder_elements():
             "elements": [{
                 "element_id": "chart-1",
                 "element_type": "chart",
-                "mapping_ids": ["mapping-1"],
+                "content": {
+                    "title": "Revenue by quarter",
+                    "chart_type": "bar",
+                    "categories": ["Q1", "Q2"],
+                    "series": [{"name": "Revenue", "values": [10, 12]}],
+                    "source_references": [reference.model_dump(mode="json")],
+                },
+            }],
+        }],
+    }
+    parsed = PPTXArtifactContent.model_validate(chart_payload)
+    assert isinstance(parsed.slides[0].elements[0], PPTXChartElement)
+
+    payload = {
+        "target_format": "pptx",
+        "presentation_title": "Quarterly Results",
+        "slides": [{
+            "slide_id": "slide-1",
+            "title": "Revenue",
+            "elements": [{
+                "element_id": "image-1",
+                "element_type": "image_placeholder",
             }],
         }],
     }
     with pytest.raises(ValidationError):
         PPTXArtifactContent.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("chart_type", "native_type"),
+    [
+        ("bar", XL_CHART_TYPE.BAR_CLUSTERED),
+        ("line", XL_CHART_TYPE.LINE),
+        ("pie", XL_CHART_TYPE.PIE),
+    ],
+)
+def test_writer_creates_editable_native_chart_with_title_categories_series_and_values(chart_type, native_type):
+    content = PPTXArtifactContent(
+        target_format="pptx",
+        presentation_title="Quarterly Results",
+        slides=[{
+            "slide_id": "slide-chart",
+            "title": "Revenue",
+            "elements": [PPTXChartElement(
+                element_id="chart-1",
+                element_type="chart",
+                mapping_ids=["mapping-chart"],
+                content=PPTXChartContent(
+                    title="Revenue by quarter",
+                    chart_type=chart_type,
+                    categories=["Q1", "Q2", "Q3"],
+                    series=[{
+                        "name": "Revenue",
+                        "values": [10, 12, 15],
+                    }],
+                    source_references=[_reference()],
+                ),
+            )],
+        }],
+    )
+    output = render_pptx(content, is_mock=False, provenance={"document_id": "doc-chart"})
+
+    validate_pptx_output(output)
+    presentation = Presentation(BytesIO(output))
+    slide = presentation.slides[0]
+    chart_shape = next(shape for shape in slide.shapes if shape.has_chart)
+    chart = chart_shape.chart
+    assert chart.chart_type == native_type
+    assert chart.chart_title.text_frame.text == "Revenue by quarter"
+    assert [category.label for category in chart.plots[0].categories] == ["Q1", "Q2", "Q3"]
+    assert chart.series[0].name == "Revenue"
+    assert list(chart.series[0].values) == [10.0, 12.0, 15.0]
+    assert "Source: block-revenue" in "\n".join(
+        shape.text for shape in slide.shapes if shape.has_text_frame
+    )
+    assert '"block_id": "block-revenue"' in slide.notes_slide.notes_text_frame.text
+
+
+def test_chart_allows_missing_values_as_native_gaps():
+    chart_content = PPTXChartContent(
+        title="Quarterly revenue",
+        chart_type="line",
+        categories=["Q1", "Q2", "Q3"],
+        series=[{"name": "Revenue", "values": [10, None, 15]}],
+        source_references=[_reference()],
+    )
+    content = PPTXArtifactContent(
+        target_format="pptx",
+        presentation_title="Results",
+        slides=[{
+            "slide_id": "slide-chart",
+            "title": "Revenue",
+            "elements": [PPTXChartElement(element_id="chart-1", element_type="chart", content=chart_content)],
+        }],
+    )
+    output = render_pptx(content, is_mock=False, provenance={})
+    chart = next(shape.chart for shape in Presentation(BytesIO(output)).slides[0].shapes if shape.has_chart)
+    assert list(chart.series[0].values) == [10.0, None, 15.0]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"series": [{"name": "Revenue", "values": [10]}]},
+        {"series": [{"name": "Revenue", "values": [10, "unknown"]}]},
+        {"series": [{"name": "Revenue", "values": [10, float("nan")]}]},
+        {"series": [{"name": "Revenue", "values": [None, None]}]},
+        {"categories": ["Q1", "Q2"], "series": [{"name": "Revenue", "values": [-1, 2]}], "chart_type": "pie"},
+        {"categories": ["Q1", "Q2"], "series": [
+            {"name": "Revenue", "values": [1, 2]}, {"name": "Cost", "values": [2, 3]},
+        ], "chart_type": "pie"},
+    ],
+)
+def test_chart_schema_rejects_malformed_or_unsupported_data(overrides):
+    data = {
+        "title": "Quarterly results",
+        "chart_type": "bar",
+        "categories": ["Q1", "Q2"],
+        "series": [{"name": "Revenue", "values": [10, 12]}],
+        "source_references": [_reference().model_dump(mode="json")],
+        **overrides,
+    }
+    with pytest.raises(ValidationError):
+        PPTXChartContent.model_validate(data)
+
+
+def test_chart_schema_requires_source_references_and_rejects_unknown_chart_types():
+    with pytest.raises(ValidationError):
+        PPTXChartContent.model_validate({
+            "title": "Results", "chart_type": "area", "categories": ["Q1"],
+            "series": [{"name": "Revenue", "values": [10]}],
+        })
 
 
 def test_schema_requires_source_references_for_content_items():
@@ -244,8 +375,8 @@ def test_schema_requires_source_references_for_content_items():
         PPTXArtifactContent.model_validate(payload)
 
 
-@pytest.mark.parametrize("element_type", ["chart", "image_placeholder"])
-def test_planned_chart_and_image_placeholders_are_explicitly_unsupported(element_type):
+def test_planned_image_placeholders_remain_explicitly_unsupported():
+    element_type = "image_placeholder"
     plan = TransformationPlan(
         plan_id=uuid4(),
         document_id="00000000-0000-4000-8000-000000000501",

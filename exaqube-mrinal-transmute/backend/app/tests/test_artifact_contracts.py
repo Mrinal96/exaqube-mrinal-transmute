@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from openpyxl import load_workbook
 from pydantic import ValidationError
 
 from app.models.artifacts import ARTIFACT_SCHEMA_VERSION
@@ -22,14 +23,18 @@ from app.orchestration.engine import WorkflowExecutor
 from app.prompts.artifact import ARTIFACT_PROMPT_VERSION, build_artifact_messages
 from app.services.artifact_contracts import (
     ARTIFACT_CONTRACTS,
+    NATIVE_IR_WRITERS,
     ArtifactContractConfigurationError,
     get_artifact_contract,
+    get_native_ir_writer,
     validate_artifact_contract,
 )
 from app.services.artifact_transformation import (
     ArtifactTransformationService,
     validate_artifact_references,
 )
+from app.storage.artifacts import ArtifactStore
+from app.storage.interpretations import InterpretationStore
 
 
 SOURCE_BLOCK_ID = "ir-block-financial-1"
@@ -189,16 +194,65 @@ def test_registered_artifact_contract_requires_target_and_rejects_unknown_proper
 
 
 @pytest.mark.parametrize("target_format", [DocumentFormat.XLSX, DocumentFormat.MMD])
-def test_unimplemented_targets_fail_contract_preflight_before_provider_request(tmp_path, target_format):
+def test_native_ir_writers_generate_and_persist_without_provider_request(tmp_path, target_format):
     class NeverCalledLLM:
         settings = SimpleNamespace(mock_llm=False)
 
         async def complete(self, messages):
-            raise AssertionError("Provider must not be called for an unregistered target contract.")
+            raise AssertionError("Native IR writers must not call the LLM.")
 
     service = ArtifactTransformationService(NeverCalledLLM(), tmp_path)
-    with pytest.raises(ArtifactContractConfigurationError):
-        asyncio.run(service.transform(None, None, target_format, run_id=uuid4()))
+    document_ir, interpretation = _source_inputs()
+    interpretation.metadata.source_ir_fingerprint = InterpretationStore.fingerprint(
+        document_ir.model_dump(mode="json")
+    )
+    result = asyncio.run(service.transform(
+        document_ir,
+        interpretation,
+        target_format,
+        run_id=uuid4(),
+    ))
+
+    assert target_format in NATIVE_IR_WRITERS
+    assert get_native_ir_writer(target_format) is not None
+    assert result.metadata.is_mock is False
+    assert result.metadata.provider == "native_ir"
+    assert result.metadata.prompt_version == "native_ir_writer_v1"
+    assert result.metadata.warnings
+    assert result.usage is None
+    found = ArtifactStore(tmp_path).get(document_ir.document_id, str(result.metadata.output_id))
+    assert found is not None
+    _, path = found
+    if target_format == DocumentFormat.XLSX:
+        workbook = load_workbook(path, data_only=False)
+        assert "Document" in workbook.sheetnames
+        assert "IR Content" in workbook.sheetnames
+        workbook.close()
+    else:
+        assert path.read_text(encoding="utf-8").startswith("flowchart TD")
+
+
+@pytest.mark.parametrize("target_format", [DocumentFormat.XLSX, DocumentFormat.MMD])
+def test_native_ir_writers_refuse_instructions_they_cannot_apply(tmp_path, target_format):
+    class NeverCalledLLM:
+        settings = SimpleNamespace(mock_llm=False)
+
+        async def complete(self, messages):
+            raise AssertionError("Native IR writers must not call the LLM.")
+
+    document_ir, interpretation = _source_inputs()
+    interpretation.metadata.source_ir_fingerprint = InterpretationStore.fingerprint(
+        document_ir.model_dump(mode="json")
+    )
+    service = ArtifactTransformationService(NeverCalledLLM(), tmp_path)
+    with pytest.raises(ValueError, match="cannot apply user transformation instructions"):
+        asyncio.run(service.transform(
+            document_ir,
+            interpretation,
+            target_format,
+            run_id=uuid4(),
+            user_instructions="Use an executive summary layout.",
+        ))
 
 
 @pytest.mark.parametrize(

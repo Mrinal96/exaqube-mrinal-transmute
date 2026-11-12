@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 import json
+import math
 import re
+import time
 from typing import Protocol
 from urllib.parse import urlsplit, urlunsplit
 
@@ -166,6 +169,7 @@ class OpenAICompatibleClient:
     GROQ_COMPLETION_TOKEN_BUDGET = 8192
     GROQ_TPM_LIMIT = 8000
     GROQ_PROMPT_ESTIMATE_SAFETY_TOKENS = 256
+    GROQ_PROMPT_BYTES_PER_TOKEN_ESTIMATE = 3.5
 
     def __init__(
         self,
@@ -174,6 +178,7 @@ class OpenAICompatibleClient:
         model: str,
         api_key: str = "",
         timeout_seconds: float = 60.0,
+        max_rate_limit_wait_seconds: float = 60.0,
         http_client: httpx.AsyncClient | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
@@ -187,6 +192,10 @@ class OpenAICompatibleClient:
         self.url = normalize_chat_completions_url(base_url)
         self.model = model.strip()
         self._api_key = api_key.strip()
+        self.max_rate_limit_wait_seconds = max_rate_limit_wait_seconds
+        self._tpm_remaining_tokens: int | None = None
+        self._tpm_reset_at: float | None = None
+        self._tpm_state_lock = asyncio.Lock()
         self._owns_client = http_client is None
         self._http = http_client or httpx.AsyncClient(timeout=timeout_seconds, transport=transport)
 
@@ -210,6 +219,14 @@ class OpenAICompatibleClient:
             "model": self.model,
             "messages": [message.model_dump(mode="json") for message in messages],
         }
+        request_prompt_characters = sum(len(message.content) for message in messages)
+        request_content_bytes = sum(len(message.content.encode("utf-8")) for message in messages)
+        if self.model == self.GROQ_GPT_OSS_20B:
+            estimated_prompt_tokens = self._estimate_groq_prompt_tokens(request_content_bytes)
+            prompt_estimate_method = "utf8_bytes_div_3_5_conservative"
+        else:
+            estimated_prompt_tokens = (request_prompt_characters + 3) // 4
+            prompt_estimate_method = "characters_div_4_approximation"
         if max_completion_tokens is not None:
             if (
                 isinstance(max_completion_tokens, bool)
@@ -219,8 +236,6 @@ class OpenAICompatibleClient:
                 raise LLMConfigurationError("The requested completion-token budget must be a positive integer.")
             effective_completion_budget = max_completion_tokens
             if self.model == self.GROQ_GPT_OSS_20B:
-                prompt_characters = sum(len(message.content) for message in messages)
-                estimated_prompt_tokens = (prompt_characters + 3) // 4
                 available_budget = (
                     self.GROQ_TPM_LIMIT
                     - estimated_prompt_tokens
@@ -228,18 +243,20 @@ class OpenAICompatibleClient:
                 )
                 if available_budget < 1:
                     raise LLMInvalidResponseError(
-                        "The workflow interpretation prompt is too large for the provider token budget.",
+                        "The prompt is too large for the provider token budget.",
                         failure_phase="request_budget_validation",
                         failure_reason="prompt_exceeds_tpm_budget",
                     )
                 effective_completion_budget = min(effective_completion_budget, available_budget)
+                effective_completion_budget = await self._respect_tracked_tpm_window(
+                    estimated_prompt_tokens,
+                    effective_completion_budget,
+                )
             body["max_completion_tokens"] = effective_completion_budget
         if self.model == self.GROQ_GPT_OSS_120B:
             body.setdefault("max_completion_tokens", self.GROQ_COMPLETION_TOKEN_BUDGET)
             body["reasoning_effort"] = "low"
         request_body = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        request_content_bytes = sum(len(message.content.encode("utf-8")) for message in messages)
-        request_prompt_characters = sum(len(message.content) for message in messages)
         headers["Content-Type"] = "application/json"
         logger.info(
             "llm_provider_request_metadata",
@@ -247,10 +264,13 @@ class OpenAICompatibleClient:
                 "request_body_bytes": len(request_body),
                 "request_content_bytes": request_content_bytes,
                 "request_prompt_characters": request_prompt_characters,
-                "estimated_prompt_tokens": (request_prompt_characters + 3) // 4,
-                "prompt_token_estimate_method": "characters_div_4_approximation",
+                "estimated_prompt_tokens": estimated_prompt_tokens,
+                "prompt_token_estimate_method": prompt_estimate_method,
                 "request_message_count": len(messages),
+                "requested_max_completion_tokens": max_completion_tokens,
                 "max_completion_tokens": body.get("max_completion_tokens"),
+                "tpm_window_remaining_tokens": self._tpm_remaining_tokens,
+                "tpm_window_reset_seconds": self._current_tpm_reset_seconds(),
             },
         )
         try:
@@ -260,6 +280,7 @@ class OpenAICompatibleClient:
         except httpx.RequestError as exc:
             raise LLMConnectionError() from exc
 
+        self._record_tpm_window(response.headers)
         if response.status_code >= 400:
             raise _provider_error(response)
 
@@ -283,6 +304,9 @@ class OpenAICompatibleClient:
 
         response_metadata = _response_metadata(payload)
         response_metadata["typed_token_usage_available"] = usage is not None
+        response_metadata["rate_limit_headers"] = _safe_rate_limit_headers(response.headers)
+        response_metadata["tpm_window_remaining_tokens"] = self._tpm_remaining_tokens
+        response_metadata["tpm_window_reset_seconds"] = self._current_tpm_reset_seconds()
         logger.info("llm_provider_response_metadata", extra=response_metadata)
 
         try:
@@ -310,6 +334,93 @@ class OpenAICompatibleClient:
             )
             _log_invalid_response(error, payload, usage, raw_usage=raw_usage, cause=exc)
             raise error from exc
+
+    @classmethod
+    def _estimate_groq_prompt_tokens(cls, prompt_bytes: int) -> int:
+        return math.ceil(prompt_bytes / cls.GROQ_PROMPT_BYTES_PER_TOKEN_ESTIMATE)
+
+    def _record_tpm_window(self, headers: httpx.Headers) -> None:
+        if self.model != self.GROQ_GPT_OSS_20B:
+            return
+        safe_headers = _safe_rate_limit_headers(headers)
+        remaining_value = safe_headers.get("x-ratelimit-remaining-tokens")
+        reset_value = safe_headers.get("x-ratelimit-reset-tokens")
+        try:
+            remaining = int(remaining_value) if remaining_value is not None else None
+        except ValueError:
+            remaining = None
+        reset_seconds = _parse_provider_duration(reset_value)
+        if remaining is None or remaining < 0 or reset_seconds is None:
+            return
+        self._tpm_remaining_tokens = remaining
+        self._tpm_reset_at = time.monotonic() + reset_seconds
+
+    def _current_tpm_reset_seconds(self) -> float | None:
+        if self._tpm_reset_at is None:
+            return None
+        return max(0.0, self._tpm_reset_at - time.monotonic())
+
+    async def _respect_tracked_tpm_window(
+        self,
+        estimated_prompt_tokens: int,
+        completion_budget: int,
+    ) -> int:
+        if self._tpm_remaining_tokens is None or self._tpm_reset_at is None:
+            return completion_budget
+
+        async with self._tpm_state_lock:
+            remaining = self._tpm_remaining_tokens
+            reset_at = self._tpm_reset_at
+            delay = max(0.0, reset_at - time.monotonic())
+            if delay <= 0:
+                self._tpm_remaining_tokens = None
+                self._tpm_reset_at = None
+                return completion_budget
+
+            available_completion = (
+                remaining
+                - estimated_prompt_tokens
+                - self.GROQ_PROMPT_ESTIMATE_SAFETY_TOKENS
+            )
+            if available_completion >= completion_budget:
+                return completion_budget
+
+            if delay <= self.max_rate_limit_wait_seconds:
+                logger.info(
+                    "llm_tpm_window_wait",
+                    extra={
+                        "tpm_window_remaining_tokens": remaining,
+                        "tpm_window_reset_seconds": delay,
+                        "estimated_prompt_tokens": estimated_prompt_tokens,
+                        "requested_max_completion_tokens": completion_budget,
+                        "retry_stop_reason": "wait_for_tpm_window_reset",
+                    },
+                )
+                await asyncio.sleep(delay + 0.01)
+                if self._tpm_reset_at == reset_at:
+                    self._tpm_remaining_tokens = None
+                    self._tpm_reset_at = None
+                return completion_budget
+
+            if available_completion > 0:
+                logger.warning(
+                    "llm_tpm_budget_clamped_to_current_window",
+                    extra={
+                        "tpm_window_remaining_tokens": remaining,
+                        "tpm_window_reset_seconds": delay,
+                        "estimated_prompt_tokens": estimated_prompt_tokens,
+                        "requested_max_completion_tokens": completion_budget,
+                        "max_completion_tokens": available_completion,
+                        "retry_stop_reason": "window_reset_exceeds_wait_cap",
+                    },
+                )
+                return min(completion_budget, available_completion)
+
+            raise LLMInvalidResponseError(
+                "The current provider token window cannot fit this prompt; retry after the token window resets.",
+                failure_phase="request_budget_validation",
+                failure_reason="tpm_window_headroom_insufficient",
+            )
 
     @staticmethod
     def _parse_completion(payload: object) -> tuple[str, str | None, str | None]:

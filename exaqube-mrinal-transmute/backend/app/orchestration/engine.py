@@ -23,6 +23,7 @@ from app.services.artifact_transformation import (
     UnsupportedArtifactElementError,
     UnsupportedArtifactFormatError,
 )
+from app.services.native_writer_errors import UnsupportedIRContentError
 from app.services.artifact_contracts import ArtifactContractConfigurationError
 from app.services.interpretation import InterpretationService
 from app.services.llm_client import LLMProviderError
@@ -34,6 +35,7 @@ from app.storage.workflows import WorkflowStore
 
 logger = logging.getLogger(__name__)
 WORKFLOW_INTERPRETATION_MAX_COMPLETION_TOKENS = 4096
+WORKFLOW_PLANNING_MAX_COMPLETION_TOKENS = 4096
 
 
 @dataclass(frozen=True)
@@ -206,6 +208,7 @@ class WorkflowExecutor:
                 context.interpretation,
                 node.target_format,
                 node.instruction or None,
+                max_completion_tokens=WORKFLOW_PLANNING_MAX_COMPLETION_TOKENS,
             )
             return NodeValue(
                 context.document_ir,
@@ -264,6 +267,8 @@ class WorkflowExecutor:
             return "target_renderer_unavailable", "No native renderer is available for this target format."
         if isinstance(exc, UnsupportedArtifactElementError):
             return "unsupported_artifact_element", str(exc)
+        if isinstance(exc, UnsupportedIRContentError):
+            return "unsupported_ir_content", "The canonical IR contains content this native writer cannot safely represent."
         if isinstance(exc, LLMProviderError):
             return "provider_error", "The configured model provider could not complete this node."
         if isinstance(exc, ValueError):

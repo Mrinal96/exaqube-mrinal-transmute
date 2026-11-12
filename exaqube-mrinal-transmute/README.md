@@ -81,17 +81,18 @@ Initial backend tests can be run from `backend/` with `python -m pytest app/test
 - LLM-backed semantic interpretation and target-specific transformation planning, with validated, separately persisted results and operation usage/cost metadata.
 - Persisted workflow definitions and runs; validated DAG execution with topological ordering, branching, run/node states, downstream blocking on failure, and independent-branch continuation.
 - SSE updates for workflow runs, including replay from a sequence ID, plus frontend Run Workflow integration and run-status refresh.
-- Native, editable HTML, DOCX and PPTX artifact generation, output validation, persistent artifact storage and download endpoints. PPTX supports text, bullets, tables and metrics; unsupported chart/image placeholders are rejected.
+- Native HTML, DOCX, XLSX, MMD and editable PPTX artifact generation, output validation, persistent artifact storage and download endpoints. XLSX and MMD are deterministic exports from canonical IR and do not call an LLM; PPTX supports text, bullets, tables, metrics, and editable bar, line, and pie charts; image placeholders are rejected.
 - Docker Compose setup with independent frontend/backend services and health checks.
 
 ## Known limitations
 
-- Native output writers currently support HTML, DOCX and PPTX. XLSX and MMD can be ingested and used as sources, but their output contracts/renderers are unavailable; therefore all 20 directed conversions are not implemented.
+- HTML, DOCX and PPTX use target-specific LLM artifact contracts. XLSX and MMD writers deterministically export canonical IR without applying transformation plans or user instructions, so all 20 semantic conversion directions are not implemented.
 - Workflow nodes execute sequentially in one backend process through FastAPI background tasks. There is no durable job queue, parallel branch execution, cancellation endpoint, or automatic recovery/resume after a backend restart.
 - Workflow definitions and run snapshots persist, but the frontend does not restore the saved workflow definition/canvas layout after a page reload. It can restore the last run reference and reload its status/events.
-- PPTX chart and image-placeholder elements are explicitly unsupported. The writer produces editable text, bullet, table and metric content.
+- PPTX charts are limited to validated bar, line, and single-series pie charts. Image placeholders remain unsupported; XLSX and MMD native writers are not yet available.
 - Per-fingerprint concurrency locks are process-local; use a durable coordination mechanism before running multiple backend workers or replicas.
 - Embedded media are retained as source references rather than decoded or visually interpreted; remote HTML media are referenced but not downloaded.
-- HTML output receives structural validation, but there is no native Mermaid writer or full Mermaid grammar validation.
+- MMD output receives a recognized-declaration check rather than full grammar validation because no Mermaid parser or CLI is installed. Original MMD diagrams are preserved only when no additional IR structures need merging.
+- XLSX formulas are written as executable formulas only when their source sheet/cell is known and the expression passes the writer's safe-function policy; other formulas are preserved as text with a workbook note. XLSX chart and diagram IR blocks are explicitly rejected.
 - The upload endpoint does not run malware scanning. Storage is local and intended for this single-user assignment foundation.
 

@@ -6,6 +6,8 @@ from typing import Any
 
 from pptx import Presentation
 from pptx.dml.color import RGBColor
+from pptx.chart.data import CategoryChartData
+from pptx.enum.chart import XL_CHART_TYPE
 from pptx.enum.shapes import MSO_SHAPE
 from pptx.oxml.xmlchemy import OxmlElement
 from pptx.util import Inches, Pt
@@ -15,6 +17,8 @@ from app.models.artifacts import (
     ArtifactTable,
     ArtifactText,
     PPTXArtifactContent,
+    PPTXChartContent,
+    PPTXChartElement,
     PPTXBulletsElement,
     PPTXCalloutElement,
     PPTXMetricElement,
@@ -75,6 +79,8 @@ def render_pptx(
                 y = _add_table(slide, element.content, y, bottom)
             elif isinstance(element, PPTXMetricElement):
                 y = _add_metric(slide, element.content, y, bottom)
+            elif isinstance(element, PPTXChartElement):
+                y = _add_chart(slide, element.content, y, bottom)
             else:  # Defensive guard for values introduced outside the Pydantic union.
                 raise ValueError("Unsupported PPTX artifact element.")
 
@@ -228,6 +234,43 @@ def _add_metric(slide, metric: ArtifactMetric, y, bottom):
     return y + height + Inches(0.25)
 
 
+def _add_chart(slide, chart_data: PPTXChartContent, y, bottom):
+    """Create a native editable chart; None values are represented as data gaps."""
+    height = Inches(4.8)
+    citation_space = Inches(0.38)
+    _check_room(y, height + citation_space, bottom)
+
+    chart_type = {
+        "bar": XL_CHART_TYPE.BAR_CLUSTERED,
+        "line": XL_CHART_TYPE.LINE,
+        "pie": XL_CHART_TYPE.PIE,
+    }[chart_data.chart_type]
+    data = CategoryChartData()
+    data.categories = chart_data.categories
+    for series in chart_data.series:
+        data.add_series(series.name, series.values)
+
+    shape = slide.shapes.add_chart(
+        chart_type,
+        Inches(0.72),
+        y,
+        Inches(11.9),
+        height,
+        data,
+    )
+    chart = shape.chart
+    chart.has_title = True
+    chart.chart_title.text_frame.text = chart_data.title
+    chart.has_legend = True
+    if chart_data.chart_type == "pie":
+        plot = chart.plots[0]
+        plot.has_data_labels = True
+        plot.data_labels.show_category_name = True
+        plot.data_labels.show_percentage = True
+    _add_visible_source(slide, chart_data, y + height)
+    return y + height + citation_space
+
+
 def _style_table_cell(cell, *, bold: bool = False) -> None:
     for paragraph in cell.text_frame.paragraphs:
         paragraph.font.size = Pt(11)
@@ -268,6 +311,8 @@ def _slide_notes(slide_content, provenance: dict[str, Any]) -> str:
         elif isinstance(element, PPTXBulletsElement):
             values = element.items
         elif isinstance(element, (PPTXTableElement, PPTXMetricElement)):
+            values = [element.content]
+        elif isinstance(element, PPTXChartElement):
             values = [element.content]
         for value in values:
             references.extend(reference.model_dump(mode="json", exclude_none=True) for reference in value.source_references)

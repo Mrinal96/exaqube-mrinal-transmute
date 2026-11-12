@@ -52,11 +52,6 @@ def test_retry_delay_configuration_allows_sixty_seconds_but_not_more():
         make_settings(llm_max_retry_delay_seconds=60.1)
 
 
-def test_retry_delay_configuration_allows_sixty_seconds_but_not_more():
-    assert make_settings(llm_max_retry_delay_seconds=60).llm_max_retry_delay_seconds == 60
-    with pytest.raises(ValidationError):
-        make_settings(llm_max_retry_delay_seconds=60.1)
-
 
 def clear_llm_environment(monkeypatch) -> None:
     for name in (
@@ -159,7 +154,9 @@ def test_groq_gpt_oss_20b_workflow_budget_is_sent_and_kept_within_tpm_headroom()
     )
     run(_service_complete_with_budget_and_close(service, messages, 4096))
 
-    estimated_prompt_tokens = (sum(len(message.content) for message in messages) + 3) // 4
+    estimated_prompt_tokens = client._estimate_groq_prompt_tokens(
+        sum(len(message.content.encode("utf-8")) for message in messages)
+    )
     assert captured["body"]["max_completion_tokens"] == 4096
     assert "max_tokens" not in captured["body"]
     assert (
@@ -189,12 +186,92 @@ def test_groq_gpt_oss_20b_workflow_budget_clamps_for_large_prompts():
     service = LLMService(make_settings(model="openai/gpt-oss-20b"), client=client)
     run(_service_complete_with_budget_and_close(service, long_messages, 4096))
 
-    estimated_prompt_tokens = (len(long_messages[0].content) + 3) // 4
+    estimated_prompt_tokens = client._estimate_groq_prompt_tokens(len(long_messages[0].content.encode("utf-8")))
     assert captured["body"]["max_completion_tokens"] == (
         client.GROQ_TPM_LIMIT
         - estimated_prompt_tokens
         - client.GROQ_PROMPT_ESTIMATE_SAFETY_TOKENS
     )
+
+
+def test_groq_20b_logs_exact_conservative_outgoing_budget_for_long_prompt(caplog):
+    captured = {}
+    long_messages = [LLMRequestMessage(role="user", content="structured planning input " * 700)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}]},
+        )
+
+    client = OpenAICompatibleClient(
+        base_url="https://api.groq.com/openai/v1",
+        model="openai/gpt-oss-20b",
+        transport=httpx.MockTransport(handler),
+    )
+    service = LLMService(make_settings(model="openai/gpt-oss-20b"), client=client)
+    run(_service_complete_with_budget_and_close(service, long_messages, 4096))
+
+    prompt_bytes = sum(len(message.content.encode("utf-8")) for message in long_messages)
+    estimated_prompt_tokens = client._estimate_groq_prompt_tokens(prompt_bytes)
+    expected_budget = min(
+        4096,
+        client.GROQ_TPM_LIMIT
+        - estimated_prompt_tokens
+        - client.GROQ_PROMPT_ESTIMATE_SAFETY_TOKENS,
+    )
+    assert captured["body"]["max_completion_tokens"] == expected_budget
+    request_log = next(record for record in caplog.records if record.message == "llm_provider_request_metadata")
+    assert request_log.requested_max_completion_tokens == 4096
+    assert request_log.max_completion_tokens == expected_budget
+    assert request_log.estimated_prompt_tokens == estimated_prompt_tokens
+    assert (
+        estimated_prompt_tokens
+        + expected_budget
+        + client.GROQ_PROMPT_ESTIMATE_SAFETY_TOKENS
+        <= client.GROQ_TPM_LIMIT
+    )
+
+
+def test_groq_20b_waits_for_tracked_tpm_reset_before_next_workflow_call(monkeypatch):
+    captured = []
+    waits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        headers = {}
+        if len(captured) == 1:
+            headers = {
+                "x-ratelimit-remaining-tokens": "1333",
+                "x-ratelimit-reset-tokens": "50s",
+            }
+        return httpx.Response(
+            200,
+            headers=headers,
+            json={"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]},
+        )
+
+    async def no_wait(delay: float) -> None:
+        waits.append(delay)
+
+    monkeypatch.setattr("app.services.llm_client.asyncio.sleep", no_wait)
+    client = OpenAICompatibleClient(
+        base_url="https://api.groq.com/openai/v1",
+        model="openai/gpt-oss-20b",
+        transport=httpx.MockTransport(handler),
+    )
+
+    async def call_interpret_then_plan():
+        await client.complete([LLMRequestMessage(role="user", content="interpretation")], max_completion_tokens=4096)
+        planning_messages = [LLMRequestMessage(role="user", content="planning input " * 1000)]
+        await client.complete(planning_messages, max_completion_tokens=4096)
+        await client.aclose()
+
+    run(call_interpret_then_plan())
+    assert len(captured) == 2
+    assert waits and waits[0] >= 50
+    assert captured[1]["max_completion_tokens"] <= 4096
 
 
 def test_length_finish_reason_is_classified_as_truncated_before_json_validation(caplog):
@@ -771,6 +848,32 @@ def test_real_provider_failure_does_not_fall_back_to_mock():
     )
     with pytest.raises(LLMProviderError):
         run(_service_complete_and_close(service))
+
+
+def test_provider_rejecting_oversized_request_is_not_retried():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            413,
+            json={"error": {"code": "rate_limit_exceeded", "type": "tokens", "message": "Request too large."}},
+        )
+
+    client = OpenAICompatibleClient(
+        base_url="https://api.groq.com/openai/v1",
+        model="openai/gpt-oss-20b",
+        transport=httpx.MockTransport(handler),
+    )
+    service = LLMService(
+        make_settings(model="openai/gpt-oss-20b", llm_max_attempts=3),
+        client=client,
+    )
+    with pytest.raises(LLMProviderError) as error_info:
+        run(_service_complete_with_budget_and_close(service, MESSAGES, 4096))
+    assert error_info.value.status_code == 413
+    assert error_info.value.retryable is False
+    assert len(calls) == 1
 
 
 def test_real_provider_mode_requires_complete_configuration(monkeypatch):

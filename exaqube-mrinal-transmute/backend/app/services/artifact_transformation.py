@@ -20,6 +20,7 @@ from app.models.artifacts import (
     HTMLArtifactContent,
     HTMLArtifactSection,
     PPTXArtifactContent,
+    PPTXChartElement,
     PPTXArtifactSlide,
     PPTXBulletsElement,
     PPTXCalloutElement,
@@ -38,15 +39,18 @@ from app.services.artifact_contracts import (
     ArtifactContract,
     ArtifactContractConfigurationError,
     get_artifact_contract,
+    get_native_ir_writer,
 )
 from app.services.interpretation import SourceReferenceResolver
 from app.services.llm import LLMService
+from app.services.native_writer_errors import UnsupportedIRContentError
 from app.storage.artifacts import ArtifactStore
 from app.storage.interpretations import InterpretationStore
 
 
 logger = logging.getLogger(__name__)
 MOCK_ARTIFACT_WARNING = "MOCK_LLM is enabled; this is a deterministic source-content artifact, not an AI transformation."
+NATIVE_IR_WRITER_VERSION = "native_ir_writer_v1"
 
 
 class UnsupportedArtifactFormatError(ValueError):
@@ -88,7 +92,8 @@ class ArtifactTransformationService:
     ) -> RenderedArtifact:
         # Resolve and verify the complete schema/prompt/writer contract before
         # invoking the provider or producing a mock artifact.
-        contract = get_artifact_contract(target_format)
+        native_writer = get_native_ir_writer(target_format)
+        contract: ArtifactContract | None = None if native_writer else get_artifact_contract(target_format)
         if interpretation.document_id != document_ir.document_id:
             raise InvalidArtifactContentError("The interpretation does not belong to the supplied document.")
         source_fingerprint = InterpretationStore.fingerprint(document_ir.model_dump(mode="json"))
@@ -100,16 +105,30 @@ class ArtifactTransformationService:
             or plan.target_format != target_format
         ):
             raise InvalidArtifactContentError("The transformation plan does not match the source, interpretation, and target format.")
+        if native_writer is not None and plan is not None:
+            raise UnsupportedIRContentError(
+                f"The deterministic {target_format.value.upper()} writer serializes canonical IR and does not apply transformation plans."
+            )
+        if native_writer is not None and user_instructions and user_instructions.strip():
+            raise UnsupportedIRContentError(
+                f"The deterministic {target_format.value.upper()} writer cannot apply user transformation instructions."
+            )
         if target_format == DocumentFormat.PPTX and plan is not None:
             _reject_unsupported_pptx_plan_elements(plan)
 
         completion = None
-        is_mock = self.llm_service.settings.mock_llm
-        warnings: list[str] = []
-        if is_mock:
+        is_mock = False if native_writer is not None else self.llm_service.settings.mock_llm
+        warnings: list[str] = (
+            ["Generated directly from canonical DocumentIR by a deterministic native writer; no LLM was used."]
+            if native_writer is not None
+            else []
+        )
+        content = None
+        if native_writer is None and is_mock:
             content = _mock_content(document_ir, target_format)
             warnings.append(MOCK_ARTIFACT_WARNING)
-        else:
+        elif native_writer is None:
+            assert contract is not None
             messages = build_artifact_messages(
                 document_ir,
                 interpretation,
@@ -139,9 +158,16 @@ class ArtifactTransformationService:
                     _validate_pptx_plan_alignment(content, plan)
 
         try:
-            provenance = _pptx_provenance(document_ir, interpretation, plan, run_id) if target_format == DocumentFormat.PPTX else {}
-            rendered = contract.writer(content, is_mock, provenance)
-            contract.output_validator(rendered)
+            if native_writer is not None:
+                rendered = native_writer.writer(document_ir)
+                native_writer.output_validator(rendered)
+            else:
+                assert contract is not None and content is not None
+                provenance = _pptx_provenance(document_ir, interpretation, plan, run_id) if target_format == DocumentFormat.PPTX else {}
+                rendered = contract.writer(content, is_mock, provenance)
+                contract.output_validator(rendered)
+        except UnsupportedIRContentError:
+            raise
         except Exception as exc:
             raise InvalidArtifactContentError("The rendered output failed file validation.") from exc
 
@@ -154,10 +180,10 @@ class ArtifactTransformationService:
             interpretation_id=interpretation.interpretation_id,
             target_format=target_format,
             filename=filename,
-            provider=completion.provider if completion is not None else "mock",
-            model=completion.model if completion is not None else "mock",
-            prompt_version=ARTIFACT_PROMPT_VERSION,
-            artifact_schema_version=contract.schema_version,
+            provider=completion.provider if completion is not None else ("native_ir" if native_writer else "mock"),
+            model=completion.model if completion is not None else ("deterministic-writer" if native_writer else "mock"),
+            prompt_version=NATIVE_IR_WRITER_VERSION if native_writer else ARTIFACT_PROMPT_VERSION,
+            artifact_schema_version=native_writer.schema_version if native_writer else contract.schema_version,
             is_mock=is_mock,
             warnings=warnings,
         )
@@ -615,6 +641,8 @@ def _pptx_source_items(slide: PPTXArtifactSlide):
             yield from element.items
         elif isinstance(element, (PPTXTableElement, PPTXMetricElement)):
             yield element.content
+        elif isinstance(element, PPTXChartElement):
+            yield element.content
 
 
 def _reject_unsupported_pptx_plan_elements(plan: TransformationPlan) -> None:
@@ -625,7 +653,7 @@ def _reject_unsupported_pptx_plan_elements(plan: TransformationPlan) -> None:
         element.element_type
         for slide in structure.slides
         for element in slide.elements
-        if element.element_type in {"chart", "image_placeholder"}
+        if element.element_type == "image_placeholder"
     ]
     if unsupported:
         kinds = ", ".join(sorted(set(unsupported)))

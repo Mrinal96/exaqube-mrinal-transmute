@@ -49,6 +49,7 @@ class LLMService:
                 api_key=settings.llm_api_key.get_secret_value(),
                 model=settings.llm_model,
                 timeout_seconds=settings.llm_timeout_seconds,
+                max_rate_limit_wait_seconds=settings.llm_max_retry_delay_seconds,
                 transport=transport,
             )
 

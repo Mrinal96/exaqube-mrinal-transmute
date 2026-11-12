@@ -102,6 +102,7 @@ class PlanningService:
         user_instructions: str | None = None,
         *,
         idempotency_key: str | None = None,
+        max_completion_tokens: int | None = None,
     ) -> StoredPlan:
         target = _normalize_target_format(target_format)
         if interpretation.document_id != document_ir.document_id:
@@ -127,6 +128,8 @@ class PlanningService:
             "prompt_version": prompt_version,
             "provider_identity": provider_identity,
         }
+        if max_completion_tokens is not None:
+            fingerprint_payload["max_completion_tokens"] = max_completion_tokens
         if target == DocumentFormat.PPTX:
             fingerprint_payload["planning_schema_version"] = PPTX_PROVIDER_SCHEMA_VERSION
         input_fingerprint = self.store.fingerprint(fingerprint_payload)
@@ -152,7 +155,13 @@ class PlanningService:
             draft: TransformationPlanDraft | None = None
             if not should_mock:
                 messages = build_transformation_messages(document_ir, interpretation, target, user_instructions)
-                completion = await self.llm_service.complete(messages)
+                if max_completion_tokens is None:
+                    completion = await self.llm_service.complete(messages)
+                else:
+                    completion = await self.llm_service.complete(
+                        messages,
+                        max_completion_tokens=max_completion_tokens,
+                    )
                 should_mock = completion.is_mock
                 if not should_mock:
                     draft = _parse_plan_draft(completion.content, target)

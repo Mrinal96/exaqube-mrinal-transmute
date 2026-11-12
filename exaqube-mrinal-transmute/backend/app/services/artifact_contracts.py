@@ -13,7 +13,10 @@ from app.models.artifacts import (
     PPTXArtifactContent,
 )
 from app.models.documents import DocumentFormat
+from app.models.intermediate import DocumentIR
 from app.services.artifact_renderers import render_docx, render_html, validate_rendered_output
+from app.services.mmd_writer import IR_MMD_SCHEMA_VERSION, render_mmd, validate_mmd_output
+from app.services.xlsx_writer import IR_XLSX_SCHEMA_VERSION, render_xlsx, validate_xlsx_output
 from app.services.pptx_writer import render_pptx
 
 
@@ -28,6 +31,7 @@ class ArtifactContractConfigurationError(RuntimeError):
 
 
 ArtifactWriter = Callable[[BaseModel, bool, dict[str, object]], bytes]
+IRWriter = Callable[[DocumentIR], bytes]
 
 
 @dataclass(frozen=True)
@@ -39,6 +43,14 @@ class ArtifactContract:
     output_validator: Callable[[bytes], None]
     standalone_guidance: str
     planned_guidance: str
+
+
+@dataclass(frozen=True)
+class NativeIRWriterContract:
+    target_format: DocumentFormat
+    schema_version: str
+    writer: IRWriter
+    output_validator: Callable[[bytes], None]
 
 
 def _render_html(content: BaseModel, is_mock: bool, provenance: dict[str, object]) -> bytes:
@@ -95,13 +107,34 @@ ARTIFACT_CONTRACTS: dict[DocumentFormat, ArtifactContract] = {
         output_validator=lambda content: validate_rendered_output(content, "pptx"),
         standalone_guidance=(
             "Generate a native editable PowerPoint. Use editable title/text shapes, bullet paragraphs, native tables, "
-            "metric callouts, and source-backed callouts only. Charts and image placeholders are unsupported."
+            "metric callouts, source-backed callouts, and native bar, line, or pie charts when categories and numeric "
+            "series are supported by cited source content. Do not infer missing chart values. Image placeholders are unsupported."
         ),
         planned_guidance=(
             "Follow the supplied slide and element IDs, purpose, visual guidance, and mapping destinations exactly. "
-            "Use only editable titles, text, bullets, tables, metric callouts, and source-backed callouts. "
-            "Charts and image placeholders are unsupported; do not invent chart data or images."
+            "Use editable titles, text, bullets, tables, metric callouts, source-backed callouts, and native bar, line, "
+            "or pie charts where planned. For charts return title, chart_type, categories, named series with one numeric "
+            "value or null per category, and source_references copied from the mapped source. Never invent values or "
+            "fill gaps. Image placeholders are unsupported; do not invent images."
         ),
+    ),
+}
+
+
+# These writers serialize the already validated canonical IR directly. They do
+# not call the LLM or reuse its target-content schemas.
+NATIVE_IR_WRITERS: dict[DocumentFormat, NativeIRWriterContract] = {
+    DocumentFormat.XLSX: NativeIRWriterContract(
+        target_format=DocumentFormat.XLSX,
+        schema_version=IR_XLSX_SCHEMA_VERSION,
+        writer=render_xlsx,
+        output_validator=validate_xlsx_output,
+    ),
+    DocumentFormat.MMD: NativeIRWriterContract(
+        target_format=DocumentFormat.MMD,
+        schema_version=IR_MMD_SCHEMA_VERSION,
+        writer=render_mmd,
+        output_validator=validate_mmd_output,
     ),
 }
 
@@ -115,6 +148,10 @@ def get_artifact_contract(target_format: DocumentFormat) -> ArtifactContract:
         )
     validate_artifact_contract(contract)
     return contract
+
+
+def get_native_ir_writer(target_format: DocumentFormat) -> NativeIRWriterContract | None:
+    return NATIVE_IR_WRITERS.get(target_format)
 
 
 def validate_artifact_contract(contract: ArtifactContract) -> None:
@@ -163,4 +200,4 @@ def _all_object_schemas_forbid_extra_properties(schema: object) -> bool:
     return True
 
 
-SUPPORTED_ARTIFACT_FORMATS = frozenset(ARTIFACT_CONTRACTS)
+SUPPORTED_ARTIFACT_FORMATS = frozenset(ARTIFACT_CONTRACTS) | frozenset(NATIVE_IR_WRITERS)

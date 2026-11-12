@@ -590,8 +590,8 @@ def test_artifact_schema_failure_logs_sanitized_diagnostics(caplog):
     assert record.failure_phase == "artifact_schema_validation"
     assert record.target_format == "docx"
     assert record.schema_model == "DOCXArtifactContent"
-    assert record.prompt_version == "artifact_v6"
-    assert record.artifact_schema_version == "1.0"
+    assert record.prompt_version == "artifact_v7"
+    assert record.artifact_schema_version == "1.1"
     assert record.json_parsing_succeeded is True
     assert record.content_empty is False
     assert record.contains_markdown_code_fence is False

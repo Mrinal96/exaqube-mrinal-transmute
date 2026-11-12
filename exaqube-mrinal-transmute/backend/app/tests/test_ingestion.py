@@ -6,6 +6,8 @@ from fastapi.testclient import TestClient
 from openpyxl import Workbook
 from pydantic import ValidationError
 from pptx import Presentation
+from pptx.chart.data import CategoryChartData
+from pptx.enum.chart import XL_CHART_TYPE
 
 from app.config import Settings
 from app.main import app
@@ -24,6 +26,14 @@ def make_pptx(slides: int = 1) -> bytes:
         table.cell(0, 1).text = "Value"
         table.cell(1, 0).text = "Revenue"
         table.cell(1, 1).text = "$12"
+        chart_data = CategoryChartData()
+        chart_data.categories = ["Q1", "Q2"]
+        chart_data.add_series("Revenue", [10, 12])
+        chart = slide.shapes.add_chart(
+            XL_CHART_TYPE.COLUMN_CLUSTERED, 0, 0, 4_000_000, 2_000_000, chart_data
+        ).chart
+        chart.has_title = True
+        chart.chart_title.text_frame.text = "Quarterly revenue"
     output = BytesIO()
     presentation.save(output)
     return output.getvalue()
@@ -102,6 +112,13 @@ def test_reader_extraction_preserves_structure_and_locations(client):
     pptx_ir = client.get(f"/api/documents/{pptx['id']}/ir").json()
     assert pptx_ir["sections"][0]["title"] == "Slide 1 heading"
     assert any(block["kind"] == "table" for block in pptx_ir["sections"][0]["blocks"])
+    chart_block = next(block for block in pptx_ir["sections"][0]["blocks"] if block["kind"] == "chart")
+    assert chart_block["attributes"]["title"] == "Quarterly revenue"
+    assert chart_block["attributes"]["series"][0] == {
+        "series": "Revenue",
+        "categories": ["Q1", "Q2"],
+        "values": [10.0, 12.0],
+    }
     assert pptx_ir["sections"][0]["source"]["slide_number"] == 1
 
     xlsx = client.post("/api/documents/upload", files={"file": ("metrics.xlsx", make_xlsx(), "")}).json()

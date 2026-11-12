@@ -7,10 +7,12 @@ import json
 from pathlib import Path
 from uuid import UUID
 
+import httpx
 import pytest
 from bs4 import BeautifulSoup
 from docx import Document as WordDocument
 from fastapi.testclient import TestClient
+from openpyxl import load_workbook
 from pptx import Presentation
 
 from app.config import Settings, get_settings
@@ -22,7 +24,7 @@ from app.services.container import get_interpretation_service, get_planning_serv
 from app.services.interpretation import InterpretationService
 from app.services.llm import LLMService
 from app.services.planning import PlanningService
-from app.services.llm_client import LLMInvalidResponseError, LLMProviderError
+from app.services.llm_client import LLMInvalidResponseError, LLMProviderError, OpenAICompatibleClient
 from app.storage.interpretations import InterpretationStore
 from app.storage.transformations import TransformationStore
 
@@ -599,9 +601,15 @@ def test_configured_llm_generates_valid_cited_pptx_artifact(api):
             "visual_guidance": "Keep the slide simple and emphasize the reported amount.",
             "title_source_references": [reference],
             "elements": [{
-                "element_id": "element-revenue",
-                "element_type": "paragraph",
-                "content": {"text": "Revenue was $12 million.", "source_references": [reference]},
+                "element_id": "element-revenue-chart",
+                "element_type": "chart",
+                "content": {
+                    "title": "Revenue by quarter",
+                    "chart_type": "bar",
+                    "categories": ["Q1", "Q2", "Q3"],
+                    "series": [{"name": "Revenue", "values": [10, 11, 12]}],
+                    "source_references": [reference],
+                },
             }],
         }],
     }
@@ -613,15 +621,16 @@ def test_configured_llm_generates_valid_cited_pptx_artifact(api):
     assert response.status_code == 201, response.text
     body = response.json()
     assert body["output"]["is_mock"] is False
-    assert body["output"]["artifact_schema_version"] == "1.0"
+    assert body["output"]["artifact_schema_version"] == "1.1"
     assert body["usage"] == {"input_tokens": 120, "output_tokens": 80, "total_tokens": 200}
     downloaded = client.get(body["download_url"])
     assert downloaded.status_code == 200
     presentation = Presentation(BytesIO(downloaded.content))
     slide = presentation.slides[0]
-    assert "Revenue was $12 million." in "\n".join(
-        shape.text for shape in slide.shapes if shape.has_text_frame
-    )
+    chart_shape = next(shape for shape in slide.shapes if shape.has_chart)
+    assert chart_shape.chart.chart_title.text_frame.text == "Revenue by quarter"
+    assert chart_shape.chart.series[0].name == "Revenue"
+    assert list(chart_shape.chart.series[0].values) == [10.0, 11.0, 12.0]
     notes = slide.notes_slide.notes_text_frame.text
     assert '"block_id"' in notes
     assert "Summarize the reported revenue result." in notes
@@ -639,8 +648,8 @@ def test_configured_llm_generates_valid_cited_pptx_artifact(api):
     diagnostics = error["details"]
     assert diagnostics["target_format"] == "pptx"
     assert diagnostics["schema_model"] == "PPTXArtifactContent"
-    assert diagnostics["prompt_version"] == "artifact_v6"
-    assert diagnostics["artifact_schema_version"] == "1.0"
+    assert diagnostics["prompt_version"] == "artifact_v7"
+    assert diagnostics["artifact_schema_version"] == "1.1"
     assert diagnostics["json_parsing_succeeded"] is True
     assert any(
         item["field_path"] == ["undeclared_contract_field"]
@@ -650,15 +659,15 @@ def test_configured_llm_generates_valid_cited_pptx_artifact(api):
     assert "private fixture value" not in invalid.text
 
 
-def test_transform_rejects_unsupported_target_and_missing_interpretation(api):
+def test_native_ir_targets_require_existing_interpretation(api):
     client, _, _ = api
     document_id = upload_html(client)
-    unsupported = client.post(
+    xlsx = client.post(
         f"/api/documents/{document_id}/transformations",
         json={"target_format": "xlsx"},
     )
-    assert unsupported.status_code == 422
-    assert unsupported.json()["error"]["code"] == "target_renderer_unavailable"
+    assert xlsx.status_code == 409
+    assert xlsx.json()["error"]["code"] == "interpretation_required"
 
     missing = client.post(
         f"/api/documents/{document_id}/transformations",
@@ -666,6 +675,49 @@ def test_transform_rejects_unsupported_target_and_missing_interpretation(api):
     )
     assert missing.status_code == 409
     assert missing.json()["error"]["code"] == "interpretation_required"
+
+
+def test_xlsx_and_mmd_native_ir_artifacts_download_without_llm_generation(api):
+    client, _, _ = api
+    document_id = upload_html(client)
+    interpretation = client.post(f"/api/documents/{document_id}/interpretations", json={})
+    assert interpretation.status_code == 201
+
+    xlsx_response = client.post(
+        f"/api/documents/{document_id}/transformations",
+        json={"target_format": "xlsx"},
+    )
+    assert xlsx_response.status_code == 201, xlsx_response.text
+    xlsx_body = xlsx_response.json()
+    assert xlsx_body["output"]["provider"] == "native_ir"
+    assert xlsx_body["output"]["model"] == "deterministic-writer"
+    assert xlsx_body["output"]["is_mock"] is False
+    assert xlsx_body["output"]["filename"].endswith(".xlsx")
+    assert xlsx_body["usage"] is None
+    xlsx_download = client.get(xlsx_body["download_url"])
+    assert xlsx_download.status_code == 200
+    assert xlsx_download.headers["content-type"].startswith(
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+    workbook = load_workbook(BytesIO(xlsx_download.content), data_only=False)
+    assert "Document" in workbook.sheetnames
+    assert "IR Content" in workbook.sheetnames
+    workbook.close()
+
+    mmd_response = client.post(
+        f"/api/documents/{document_id}/transformations",
+        json={"target_format": "mmd"},
+    )
+    assert mmd_response.status_code == 201, mmd_response.text
+    mmd_body = mmd_response.json()
+    assert mmd_body["output"]["provider"] == "native_ir"
+    assert mmd_body["output"]["is_mock"] is False
+    assert mmd_body["output"]["filename"].endswith(".mmd")
+    assert mmd_body["usage"] is None
+    mmd_download = client.get(mmd_body["download_url"])
+    assert mmd_download.status_code == 200
+    assert mmd_download.headers["content-type"].startswith("text/plain")
+    assert mmd_download.content.startswith(b"flowchart TD")
 
 
 def test_workflow_dag_executes_html_to_interpretation_plan_docx_and_download(api):
@@ -759,6 +811,122 @@ def test_workflow_interpretation_requests_4096_completion_tokens(api, monkeypatc
         for node_id in ("source", "interpret", "plan", "transform", "output")
     )
     assert requested_budgets == [4096]
+
+
+def test_workflow_planning_sends_bounded_completion_budget_to_provider(api, monkeypatch):
+    client, configure, default_settings = api
+    document_id = upload_html(client)
+    request_bodies = []
+    waits = []
+
+    async def no_wait(delay: float) -> None:
+        waits.append(delay)
+
+    monkeypatch.setattr("app.services.llm_client.asyncio.sleep", no_wait)
+
+    semantic_response = json.dumps({
+        "summary": "The uploaded report contains revenue information.",
+        "facts": [],
+        "metrics": [],
+        "entities": [],
+        "claims": [],
+        "relationships": [],
+        "insights": [],
+        "warnings": [],
+    })
+
+    def provider_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        request_bodies.append(body)
+        content = semantic_response if len(request_bodies) == 1 else "{}"
+        return httpx.Response(
+            200,
+            headers=(
+                {
+                    "x-ratelimit-remaining-tokens": "1333",
+                    "x-ratelimit-reset-tokens": "50s",
+                }
+                if len(request_bodies) == 1 else {}
+            ),
+            json={
+                "model": "openai/gpt-oss-20b",
+                "choices": [{"message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+            },
+        )
+
+    provider = OpenAICompatibleClient(
+        base_url="https://api.groq.com/openai/v1",
+        model="openai/gpt-oss-20b",
+        api_key="test-only-key",
+        transport=httpx.MockTransport(provider_handler),
+    )
+    provider_settings = Settings(
+        _env_file=None,
+        storage_root=default_settings.storage_root,
+        mock_llm=False,
+        llm_base_url="https://api.groq.com/openai/v1",
+        llm_api_key="test-only-key",
+        llm_model="openai/gpt-oss-20b",
+    )
+    configure(provider_settings, provider)
+
+    definition = client.post("/api/workflows", json={
+        "name": "Workflow planning completion budget",
+        "nodes": [
+            {"id": "source", "kind": "source", "document_id": document_id, "source_format": "html"},
+            {"id": "interpret", "kind": "interpretation"},
+            {"id": "plan", "kind": "planning", "target_format": "docx"},
+            {"id": "transform", "kind": "transformation", "target_format": "docx"},
+            {"id": "output", "kind": "output"},
+        ],
+        "edges": [
+            {"source": "source", "target": "interpret"},
+            {"source": "interpret", "target": "plan"},
+            {"source": "plan", "target": "transform"},
+            {"source": "transform", "target": "output"},
+        ],
+    })
+    assert definition.status_code == 201, definition.text
+    workflow_id = definition.json()["id"]
+    queued = client.post(f"/api/workflows/{workflow_id}/runs", json={})
+    assert queued.status_code == 202, queued.text
+
+    run = client.get(f"/api/workflows/{workflow_id}/runs/{queued.json()['run_id']}").json()
+    assert run["status"] == "failed"
+    assert run["node_results"]["source"]["status"] == "done"
+    assert run["node_results"]["interpret"]["status"] == "done"
+    assert run["node_results"]["plan"]["status"] == "failed"
+    assert run["node_results"]["transform"]["status"] == "blocked"
+    assert run["node_results"]["output"]["status"] == "blocked"
+    assert len(request_bodies) == 2
+
+    interpretation_prompt_bytes = sum(
+        len(message["content"].encode("utf-8")) for message in request_bodies[0]["messages"]
+    )
+    interpretation_estimate = provider._estimate_groq_prompt_tokens(interpretation_prompt_bytes)
+    expected_interpretation_budget = min(
+        4096,
+        provider.GROQ_TPM_LIMIT
+        - interpretation_estimate
+        - provider.GROQ_PROMPT_ESTIMATE_SAFETY_TOKENS,
+    )
+    assert request_bodies[0]["max_completion_tokens"] == expected_interpretation_budget
+
+    planning_request = request_bodies[1]
+    planning_prompt_bytes = sum(
+        len(message["content"].encode("utf-8")) for message in planning_request["messages"]
+    )
+    estimated_prompt_tokens = provider._estimate_groq_prompt_tokens(planning_prompt_bytes)
+    expected_budget = min(
+        4096,
+        provider.GROQ_TPM_LIMIT
+        - estimated_prompt_tokens
+        - provider.GROQ_PROMPT_ESTIMATE_SAFETY_TOKENS,
+    )
+    assert 2048 < expected_budget <= 4096
+    assert planning_request["max_completion_tokens"] == expected_budget
+    assert "max_tokens" not in planning_request
+    assert waits and waits[0] >= 49.9
 
 
 def test_workflow_dag_executes_html_to_pptx_and_download(api):
@@ -905,7 +1073,12 @@ def test_workflow_branch_failure_blocks_only_its_downstream_output(api):
             {"id": "interpret", "kind": "interpretation"},
             {"id": "good", "kind": "transformation", "target_format": "html"},
             {"id": "good-output", "kind": "output"},
-            {"id": "unsupported", "kind": "transformation", "target_format": "xlsx"},
+            {
+                "id": "unsupported",
+                "kind": "transformation",
+                "target_format": "xlsx",
+                "instruction": "Add a calculated forecast that requires an AI transformation.",
+            },
             {"id": "unsupported-output", "kind": "output"},
         ],
         "edges": [
@@ -926,8 +1099,8 @@ def test_workflow_branch_failure_blocks_only_its_downstream_output(api):
     assert run["node_results"]["good"]["status"] == "done"
     assert run["node_results"]["good-output"]["status"] == "done"
     assert run["node_results"]["unsupported"]["status"] == "failed"
-    assert run["node_results"]["unsupported"]["error_code"] == "artifact_contract_unavailable"
+    assert run["node_results"]["unsupported"]["error_code"] == "unsupported_ir_content"
     assert run["node_results"]["unsupported-output"]["status"] == "blocked"
-    # One interpretation and one supported HTML artifact request; XLSX preflight
-    # fails without issuing a third request to the configured provider.
+    # One interpretation and one supported HTML artifact request; the deterministic
+    # XLSX writer refuses the instruction without issuing a third provider request.
     assert provider.calls == 2

@@ -20,6 +20,7 @@ from app.services.artifact_transformation import (
     UnsupportedArtifactElementError,
     UnsupportedArtifactFormatError,
 )
+from app.services.native_writer_errors import UnsupportedIRContentError
 from app.services.container import get_interpretation_service
 from app.services.interpretation import InterpretationService
 from app.services.artifact_contracts import (
@@ -36,7 +37,9 @@ logger = logging.getLogger(__name__)
 SUPPORTED_RENDERERS = SUPPORTED_ARTIFACT_FORMATS
 MEDIA_TYPES = {
     DocumentFormat.HTML: "text/html; charset=utf-8",
+    DocumentFormat.XLSX: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     DocumentFormat.DOCX: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    DocumentFormat.MMD: "text/plain; charset=utf-8",
     DocumentFormat.PPTX: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
 
@@ -61,7 +64,7 @@ async def create_transformation(
 ) -> ArtifactOperationResponse:
     document_id = _document_uuid(document_id)
     if body.target_format not in SUPPORTED_RENDERERS:
-        raise APIError(422, "target_renderer_unavailable", "A native renderer is currently available for HTML, DOCX, and PPTX.")
+        raise APIError(422, "target_renderer_unavailable", "A native renderer is currently available for the supported document formats.")
     document_ir = require_document(settings.storage_root, document_id)
     store = InterpretationStore(settings.storage_root)
     if body.interpretation_id is not None:
@@ -111,9 +114,11 @@ async def create_transformation(
             except Exception:
                 logger.exception("artifact_operation_record_write_failed")
             if isinstance(exc, UnsupportedArtifactFormatError):
-                raise APIError(422, "target_renderer_unavailable", "A native renderer is currently available for HTML, DOCX, and PPTX.") from exc
+                raise APIError(422, "target_renderer_unavailable", "A native renderer is currently available for the supported document formats.") from exc
             if isinstance(exc, UnsupportedArtifactElementError):
                 raise APIError(422, "unsupported_artifact_element", str(exc)) from exc
+            if isinstance(exc, UnsupportedIRContentError):
+                raise APIError(422, "unsupported_ir_content", str(exc)) from exc
             if isinstance(exc, ArtifactContractConfigurationError):
                 logger.error(
                     "artifact_contract_preflight_failed",
