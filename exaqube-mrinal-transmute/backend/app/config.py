@@ -1,6 +1,7 @@
 """Typed application settings with safe local defaults."""
 
 from functools import lru_cache
+from decimal import Decimal
 from pathlib import Path
 
 from pydantic import Field, SecretStr, field_validator
@@ -16,6 +17,12 @@ class Settings(BaseSettings):
     llm_base_url: str = ""
     llm_api_key: SecretStr = SecretStr("")
     llm_model: str = ""
+    llm_timeout_seconds: float = Field(default=60.0, gt=0, le=300)
+    llm_max_attempts: int = Field(default=3, ge=1, le=5)
+    llm_max_retry_delay_seconds: float = Field(default=60.0, ge=0, le=60)
+    llm_input_cost_per_million_tokens: Decimal | None = Field(default=None, ge=0)
+    llm_output_cost_per_million_tokens: Decimal | None = Field(default=None, ge=0)
+    llm_pricing_version: str | None = None
     mock_llm: bool = True
     log_level: str = "INFO"
     storage_root: Path = Path("./storage")
@@ -26,6 +33,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        env_ignore_empty=True,
     )
 
     @field_validator("log_level")
@@ -38,7 +46,7 @@ class Settings(BaseSettings):
 
     @property
     def llm_configured(self) -> bool:
-        return bool(self.llm_base_url and self.llm_api_key.get_secret_value() and self.llm_model)
+        return bool(self.llm_base_url.strip() and self.llm_model.strip())
 
 
 @lru_cache

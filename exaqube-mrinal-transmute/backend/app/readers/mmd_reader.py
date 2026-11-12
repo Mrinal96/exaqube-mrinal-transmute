@@ -4,14 +4,9 @@ import re
 
 from app.models.intermediate import SourceLocation
 from app.models.intermediate import DocumentIR
+from app.core.formats import MERMAID_DECLARATIONS
 from app.readers.common import base_ir, make_block, make_section
 from app.readers.errors import ExtractionError
-
-MERMAID_DECLARATIONS = (
-    "flowchart", "graph", "sequencediagram", "classdiagram", "statediagram", "erdiagram", "journey", "gantt", "pie",
-    "mindmap", "timeline", "gitgraph", "quadrantchart", "requirementdiagram", "c4context", "c4container", "c4component",
-    "c4dynamic", "c4deployment", "xychart-beta", "block-beta", "sankey-beta", "architecture-beta", "packet-beta", "kanban", "radar-beta",
-)
 
 
 def read_mmd(content: bytes, document_id: str, filename: str) -> DocumentIR:

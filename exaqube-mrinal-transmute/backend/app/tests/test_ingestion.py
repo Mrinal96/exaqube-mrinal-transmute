@@ -4,6 +4,7 @@ import pytest
 from docx import Document as WordDocument
 from fastapi.testclient import TestClient
 from openpyxl import Workbook
+from pydantic import ValidationError
 from pptx import Presentation
 
 from app.config import Settings
@@ -107,6 +108,7 @@ def test_reader_extraction_preserves_structure_and_locations(client):
     xlsx_ir = client.get(f"/api/documents/{xlsx['id']}/ir").json()
     assert xlsx_ir["sections"][0]["title"] == "Metrics"
     assert any(block["kind"] == "formula" for block in xlsx_ir["sections"][0]["blocks"])
+    assert xlsx_ir["metrics"][0]["predicate"] == "Value"
 
     docx = client.post("/api/documents/upload", files={"file": ("report.docx", make_docx(), "")}).json()
     docx_ir = client.get(f"/api/documents/{docx['id']}/ir").json()
@@ -155,6 +157,15 @@ def test_upload_size_is_limited_to_ten_megabytes(client):
     assert response.json()["error"]["code"] == "file_too_large"
 
 
+def test_document_ids_are_unique(client):
+    ids = []
+    for _ in range(2):
+        response = client.post("/api/documents/upload", files={"file": ("map.mmd", SAMPLES["mmd"](), "")})
+        assert response.status_code == 201
+        ids.append(response.json()["id"])
+    assert ids[0] != ids[1]
+
+
 def test_presentation_slide_limit(client):
     response = client.post("/api/documents/upload", files={"file": ("too-many.pptx", make_pptx(41), "")})
     assert response.status_code == 422
@@ -173,6 +184,17 @@ def test_missing_document_returns_structured_not_found(client):
     assert response.json()["error"]["code"] == "document_not_found"
 
 
-def test_ir_schema_rejects_missing_provenance_fields():
-    with pytest.raises(ValueError):
-        DocumentIR.model_validate({"source_format": DocumentFormat.HTML.value})
+def test_missing_upload_part_returns_structured_validation_error(client):
+    response = client.post("/api/documents/upload")
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "request_validation_error"
+
+
+def test_ir_schema_requires_provenance_record():
+    with pytest.raises(ValidationError) as error_info:
+        DocumentIR.model_validate({
+            "document_id": "00000000-0000-4000-8000-000000000001",
+            "source_format": DocumentFormat.HTML.value,
+            "filename": "sample.html",
+        })
+    assert any(error["loc"] == ("provenance",) for error in error_info.value.errors())

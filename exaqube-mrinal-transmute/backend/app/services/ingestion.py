@@ -54,6 +54,15 @@ def ingest_document(filename: str | None, content: bytes, storage_root: Path, ma
         extraction_status="complete",
         warnings=ir.warnings,
     )
+    ir.metadata.update({
+        "original_filename": safe_name,
+        "file_size_bytes": len(content),
+        "sha256": metadata.sha256,
+        "detected_mime": detected_mime,
+        "uploaded_at": metadata.uploaded_at.isoformat(),
+    })
+    for record in ir.provenance:
+        record.details.update({"sha256": metadata.sha256, "original_filename": safe_name})
     try:
         save_document(
             storage_root,

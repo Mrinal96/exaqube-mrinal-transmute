@@ -5,11 +5,10 @@ from __future__ import annotations
 import re
 import zipfile
 from io import BytesIO
-from xml.etree import ElementTree
 
 from app.core.errors import APIError
+from app.core.formats import MERMAID_DECLARATIONS
 from app.models.documents import DocumentFormat
-from app.readers.mmd_reader import MERMAID_DECLARATIONS
 
 
 MAX_ARCHIVE_UNPACKED_BYTES = 100 * 1024 * 1024
@@ -38,10 +37,10 @@ def validate_actual_type(filename: str, content: bytes) -> tuple[DocumentFormat,
         detected, mime = _detect_openxml(content)
     else:
         decoded = _decode_text(content)
-        if _looks_like_html(decoded):
-            detected, mime = DocumentFormat.HTML, "text/html"
-        elif _looks_like_mermaid(decoded):
+        if _looks_like_mermaid(decoded):
             detected, mime = DocumentFormat.MMD, "text/x-mermaid"
+        elif _looks_like_html(decoded):
+            detected, mime = DocumentFormat.HTML, "text/html"
         else:
             raise APIError(422, "invalid_file_content", "The file content is not a valid HTML document or Mermaid diagram.")
 
@@ -65,9 +64,12 @@ def _looks_like_html(text: str) -> bool:
     from bs4 import BeautifulSoup
 
     soup = BeautifulSoup(text, "html.parser")
-    if soup.find("html") or soup.find("doctype"):
+    if soup.find("html") or re.search(r"(?i)<!doctype\s+html\b", text):
         return True
-    return bool(soup.find(["head", "body", "main", "article", "section", "h1", "h2", "p", "table", "ul", "ol", "div"]))
+    return bool(soup.find([
+        "head", "body", "title", "meta", "link", "main", "article", "section", "header", "footer", "nav", "aside",
+        "h1", "h2", "h3", "h4", "h5", "h6", "p", "table", "ul", "ol", "div", "span", "a", "img", "script", "style",
+    ]))
 
 
 def _looks_like_mermaid(text: str) -> bool:
@@ -90,15 +92,14 @@ def _detect_openxml(content: bytes) -> tuple[DocumentFormat, str]:
             names = set(archive.namelist())
             if "[Content_Types].xml" not in names:
                 raise APIError(422, "invalid_office_package", "The Office document is missing its package content types.")
-            content_types = ElementTree.fromstring(archive.read("[Content_Types].xml"))
-            declared_types = {element.attrib.get("ContentType", "") for element in content_types}
+            content_types = archive.read("[Content_Types].xml")
             for document_format, (required_part, required_content_type) in OPENXML_PACKAGES.items():
-                if required_part in names and required_content_type in declared_types:
+                if required_part in names and required_content_type.encode("ascii") in content_types:
                     if document_format == DocumentFormat.PPTX and not any(re.fullmatch(r"ppt/slides/slide\d+\.xml", name) for name in names):
                         continue
                     return document_format, required_content_type
     except APIError:
         raise
-    except (zipfile.BadZipFile, ElementTree.ParseError, OSError, RuntimeError) as exc:
+    except (zipfile.BadZipFile, OSError, RuntimeError) as exc:
         raise APIError(422, "invalid_office_package", "The uploaded Office document is malformed or corrupted.") from exc
     raise APIError(422, "invalid_office_package", "The uploaded ZIP file is not a valid PPTX, XLSX, or DOCX package.")

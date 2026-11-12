@@ -89,4 +89,6 @@ def read_html(content: bytes, document_id: str, filename: str) -> DocumentIR:
         ir.title = filename
     if ir.assets:
         ir.warnings.append("External or embedded HTML media are referenced in the IR; asset contents are not downloaded.")
+    if soup.find(["script", "style"]):
+        ir.warnings.append("HTML script and style source is retained in the original upload but is not interpreted as document text.")
     return ir

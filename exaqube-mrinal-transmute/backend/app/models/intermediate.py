@@ -5,6 +5,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.models.documents import DocumentFormat
+
 
 class SourceLocation(BaseModel):
     """Location in the original source, when a format exposes one."""
@@ -89,7 +91,7 @@ class ProvenanceRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
     extractor: str
     extracted_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    source_format: str
+    source_format: DocumentFormat
     details: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -99,7 +101,7 @@ class DocumentIR(BaseModel):
     model_config = ConfigDict(extra="forbid")
     schema_version: str = "1.0"
     document_id: str
-    source_format: str
+    source_format: DocumentFormat
     filename: str
     title: str = ""
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -107,8 +109,10 @@ class DocumentIR(BaseModel):
     blocks: list[IRBlock] = Field(default_factory=list)
     entities: list[Entity] = Field(default_factory=list)
     facts: list[Fact] = Field(default_factory=list)
+    metrics: list[Fact] = Field(default_factory=list)
+    claims: list[Fact] = Field(default_factory=list)
     relationships: list[Relationship] = Field(default_factory=list)
     assets: list[AssetReference] = Field(default_factory=list)
-    provenance: list[ProvenanceRecord] = Field(default_factory=list)
+    provenance: list[ProvenanceRecord] = Field(min_length=1)
     warnings: list[str] = Field(default_factory=list)
 
