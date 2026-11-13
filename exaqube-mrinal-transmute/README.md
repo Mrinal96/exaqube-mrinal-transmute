@@ -86,13 +86,13 @@ Initial backend tests can be run from `backend/` with `python -m pytest app/test
 
 ## Known limitations
 
-- HTML, DOCX and PPTX use target-specific LLM artifact contracts. XLSX and MMD writers deterministically export canonical IR without applying transformation plans or user instructions, so all 20 semantic conversion directions are not implemented.
+- HTML, DOCX and PPTX use target-specific LLM artifact contracts. XLSX and MMD are deterministic exports from canonical IR and do not apply transformation plans or user instructions, so those targets are exports rather than semantic conversions.
 - Workflow nodes execute sequentially in one backend process through FastAPI background tasks. There is no durable job queue, parallel branch execution, cancellation endpoint, or automatic recovery/resume after a backend restart.
 - Workflow definitions and run snapshots persist, but the frontend does not restore the saved workflow definition/canvas layout after a page reload. It can restore the last run reference and reload its status/events.
-- PPTX charts are limited to validated bar, line, and single-series pie charts. Image placeholders remain unsupported; XLSX and MMD native writers are not yet available.
+- PPTX charts are limited to validated bar, line, and single-series pie charts. Image placeholders remain unsupported. HTML chart and link plan components are explicitly rejected before artifact generation because the native HTML artifact contract does not yet carry their data.
 - Per-fingerprint concurrency locks are process-local; use a durable coordination mechanism before running multiple backend workers or replicas.
 - Embedded media are retained as source references rather than decoded or visually interpreted; remote HTML media are referenced but not downloaded.
-- MMD output receives a recognized-declaration check rather than full grammar validation because no Mermaid parser or CLI is installed. Original MMD diagrams are preserved only when no additional IR structures need merging.
+- MMD output receives declaration, flowchart-direction, control-character, and subgraph-balance checks, not full Mermaid grammar validation; no Mermaid parser or CLI is installed in the backend image. Original MMD diagrams are preserved only when no additional IR structures need merging.
 - XLSX formulas are written as executable formulas only when their source sheet/cell is known and the expression passes the writer's safe-function policy; other formulas are preserved as text with a workbook note. XLSX chart and diagram IR blocks are explicitly rejected.
 - The upload endpoint does not run malware scanning. Storage is local and intended for this single-user assignment foundation.
 

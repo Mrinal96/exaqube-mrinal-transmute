@@ -33,7 +33,7 @@ from app.prompts.transformation import (
     semantic_source_items,
 )
 from app.services.llm import LLMService
-from app.services.llm_client import LLMProviderError
+from app.services.llm_client import LLMProviderError, LLMTruncatedResponseError
 from app.services.planning import (
     DocumentInterpretationMismatchError,
     InvalidPlanResponseError,
@@ -136,6 +136,34 @@ class StaticLLMClient:
             provider="test-provider",
             usage=LLMTokenUsage(prompt_tokens=80, completion_tokens=40, total_tokens=120),
             is_mock=False,
+        )
+
+    async def aclose(self):
+        return None
+
+
+class ScriptedPlanningClient:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.messages = []
+
+    async def complete(self, messages):
+        self.messages.append(messages)
+        response = self.responses[min(len(self.messages) - 1, len(self.responses) - 1)]
+        if response == "truncated":
+            return LLMCompletionResult(
+                content='{"target_format":"docx","output_structure":',
+                model="test-model",
+                provider="test-provider",
+                usage=LLMTokenUsage(prompt_tokens=100, completion_tokens=200, total_tokens=300),
+                finish_reason="length",
+            )
+        return LLMCompletionResult(
+            content=response,
+            model="test-model",
+            provider="test-provider",
+            usage=LLMTokenUsage(prompt_tokens=80, completion_tokens=40, total_tokens=120),
+            finish_reason="stop",
         )
 
     async def aclose(self):
@@ -274,6 +302,7 @@ def test_destination_mismatch_to_another_declared_location_is_rejected(tmp_path,
         })
         mapping["destination"] = {"target_type": "diagram_node", "target_id": "node-2"}
     else:
+        payload["output_structure"]["sections"][0]["semantic_element"] = "section"
         payload["output_structure"]["sections"].append({
             "section_id": "html-section-2", "heading": "Other", "semantic_element": "section",
             "purpose": "Other location.", "mapping_ids": [], "components": [],
@@ -292,7 +321,7 @@ def test_destination_mismatch_to_another_declared_location_is_rejected(tmp_path,
 
 
 def test_docx_schema_uses_single_mapping_owned_destination():
-    assert PROMPT_VERSION == "transformation_v9"
+    assert PROMPT_VERSION == "transformation_v11"
     schema = _target_plan_schema(DocumentFormat.DOCX)
     mapping_schema = schema["$defs"]["ContentMapping"]
     assert "destination" in mapping_schema["required"]
@@ -318,7 +347,7 @@ def test_target_prompts_define_destination_to_exact_structure_id(target, rule_fr
     ir = make_ir()
     prompt = build_transformation_messages(ir, make_interpretation(ir), target)[0].content
 
-    assert PROMPT_VERSION == "transformation_v9"
+    assert PROMPT_VERSION == "transformation_v11"
     assert rule_fragment in prompt
     assert "must be an exact pointer to that same location" in prompt
     assert "A different but otherwise valid ID is not a valid destination" in prompt
@@ -336,7 +365,7 @@ def test_pptx_provider_schema_uses_destination_as_only_placement_source():
 
     ir = make_ir()
     prompt = build_transformation_messages(ir, make_interpretation(ir), DocumentFormat.PPTX)
-    assert prompt_version_for(DocumentFormat.PPTX) == PPTX_PROMPT_VERSION == "transformation_v10"
+    assert prompt_version_for(DocumentFormat.PPTX) == PPTX_PROMPT_VERSION == "transformation_v11"
     assert "planning_schema_version" in prompt[1].content
     assert "must not contain mapping_ids" in prompt[0].content
     assert "mutually exclusive destinations" in prompt[0].content
@@ -877,7 +906,9 @@ def test_planning_prompt_compacts_redundant_ir_interpretation_and_provenance_pay
     assert compact_interpretation["warnings"] == interpretation.warnings
     assert semantic_items[0]["source_item_id"] == "fact-1"
     assert semantic_items[-1]["source_item_id"] == "fact-48"
-    assert semantic_items[0]["semantic_item"]["source_references"][0] == facts[0].source_references[0].model_dump(mode="json", exclude_none=True)
+    assert semantic_items[0]["source_reference_ids"]
+    reference_catalog = compact_interpretation["source_reference_catalog"]
+    assert reference_catalog[semantic_items[0]["source_reference_ids"][0]] == facts[0].source_references[0].model_dump(mode="json", exclude_none=True)
     assert all(
         item["semantic_item"]["statement"] == facts[index].statement
         for index, item in enumerate(semantic_items)
@@ -903,43 +934,113 @@ def test_planning_prompt_compacts_redundant_ir_interpretation_and_provenance_pay
     assert len(json.dumps(target_schema, ensure_ascii=False, sort_keys=True)) < len(
         json.dumps(generic_schema, ensure_ascii=False, sort_keys=True)
     )
-
     legacy_system = (
         f"{SYSTEM_PROMPT}\n\nJSON Schema:\n"
         f"{json.dumps(generic_schema, ensure_ascii=False, sort_keys=True)}"
     )
     legacy_messages = [messages[0].model_copy(update={"content": legacy_system}), messages[1]]
-    provider_options = {
-        "model": "openai/gpt-oss-120b",
-        "max_completion_tokens": 8192,
-        "reasoning_effort": "low",
-    }
-    compact_request = {
-        **provider_options,
-        "messages": [message.model_dump(mode="json") for message in messages],
-    }
-    legacy_request = {
-        **provider_options,
-        "messages": [message.model_dump(mode="json") for message in legacy_messages],
-    }
+    provider_options = {"model": "openai/gpt-oss-120b", "max_completion_tokens": 8192, "reasoning_effort": "low"}
+    compact_request = {**provider_options, "messages": [message.model_dump(mode="json") for message in messages]}
+    legacy_request = {**provider_options, "messages": [message.model_dump(mode="json") for message in legacy_messages]}
     compact_request_bytes = len(json.dumps(compact_request, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
     legacy_request_bytes = len(json.dumps(legacy_request, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
     assert compact_request_bytes < legacy_request_bytes
-
-    # The schema is JSON text inside a message string, then that entire message
-    # is JSON-escaped again in the provider request. Compare equivalent
-    # serialized message arrays instead of raw UTF-8 system-content lengths.
     compact_messages_bytes = len(json.dumps(
-        [message.model_dump(mode="json") for message in messages],
-        ensure_ascii=False,
-        separators=(",", ":"),
+        [message.model_dump(mode="json") for message in messages], ensure_ascii=False, separators=(",", ":")
     ).encode("utf-8"))
     legacy_messages_bytes = len(json.dumps(
-        [message.model_dump(mode="json") for message in legacy_messages],
-        ensure_ascii=False,
-        separators=(",", ":"),
+        [message.model_dump(mode="json") for message in legacy_messages], ensure_ascii=False, separators=(",", ":")
     ).encode("utf-8"))
     assert legacy_request_bytes - compact_request_bytes == legacy_messages_bytes - compact_messages_bytes
+
+
+def test_planning_context_deduplicates_shared_citations_and_flat_block_index_losslessly():
+    ir = make_ir().model_copy(update={"blocks": [
+        IRBlock(id=BLOCK_ID, kind="text", text="Revenue was $500,000 in Q3.", source=SOURCE_LOCATION),
+    ]})
+    interpretation = make_interpretation(ir)
+    second_fact = interpretation.facts[0].model_copy(update={"statement": "Q3 revenue was reported as $500,000."})
+    interpretation = interpretation.model_copy(update={"facts": [*interpretation.facts, second_fact]})
+
+    messages = build_transformation_messages(ir, interpretation, DocumentFormat.DOCX)
+    body = json.loads(messages[1].content)
+    compact_ir = body["document_ir_untrusted_data"]
+    compact_interpretation = body["interpretation_untrusted_data"]
+    items = compact_interpretation["semantic_source_items"]
+
+    assert compact_ir["sections"][0]["blocks"][0]["id"] == BLOCK_ID
+    assert compact_ir.get("blocks", []) == []  # exact flat-index duplicate is represented under its section
+    assert len(items) == 2
+    assert items[0]["source_reference_ids"] == items[1]["source_reference_ids"]
+    assert len(compact_interpretation["source_reference_catalog"]) == 1
+    reference_id = items[0]["source_reference_ids"][0]
+    assert compact_interpretation["source_reference_catalog"][reference_id] == (
+        interpretation.facts[0].source_references[0].model_dump(mode="json", exclude_none=True)
+    )
+    assert items[0]["semantic_item"]["statement"] == interpretation.facts[0].statement
+    assert items[1]["semantic_item"]["statement"] == interpretation.facts[1].statement
+    assert "source_provenance_ref" in compact_interpretation["provenance"]
+    expanded = json.loads(messages[1].content)
+    expanded_interpretation = expanded["interpretation_untrusted_data"]
+    catalog = expanded_interpretation.pop("source_reference_catalog")
+    for item in expanded_interpretation["semantic_source_items"]:
+        item["semantic_item"]["source_references"] = [
+            catalog[reference_id] for reference_id in item.pop("source_reference_ids")
+        ]
+    assert len(messages[1].content.encode("utf-8")) < len(
+        json.dumps(expanded, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+
+
+def test_truncated_plan_gets_exactly_one_compact_recovery_and_accounts_for_both_usages(tmp_path):
+    ir = make_ir()
+    interpretation = make_interpretation(ir)
+    client = ScriptedPlanningClient(["truncated", json.dumps(make_draft(DocumentFormat.DOCX))])
+    service = PlanningService(LLMService(settings(), client=client), tmp_path)
+
+    result = run(service.create_plan_with_status(
+        ir, interpretation, DocumentFormat.DOCX, max_completion_tokens=4096
+    ))
+    plan = result.plan
+
+    assert len(client.messages) == 2
+    assert len(client.messages[1][0].content) < len(client.messages[0][0].content)
+    assert "source_reference_catalog" in client.messages[1][1].content
+    assert plan.content_mappings
+    assert plan.provenance.token_usage == LLMTokenUsage(
+        prompt_tokens=180,
+        completion_tokens=240,
+        total_tokens=420,
+    )
+
+
+def test_failed_compact_truncation_recovery_is_bounded_and_not_persisted(tmp_path):
+    ir = make_ir()
+    interpretation = make_interpretation(ir)
+    client = ScriptedPlanningClient(["truncated", "truncated"])
+    service = PlanningService(LLMService(settings(), client=client), tmp_path)
+
+    with pytest.raises(LLMTruncatedResponseError) as error:
+        run(service.create_plan_with_status(ir, interpretation, DocumentFormat.DOCX, max_completion_tokens=4096))
+
+    assert error.value.recovery_attempted is True
+    assert "one compact planning recovery attempt" in str(error.value).lower()
+    assert len(client.messages) == 2
+    assert TransformationStore(tmp_path).list_for_interpretation(ir.document_id, str(interpretation.interpretation_id)) == []
+
+
+@pytest.mark.parametrize("content", ["{invalid json", json.dumps({"target_format": "docx"})])
+def test_malformed_or_invalid_plan_is_not_retried_as_truncation(tmp_path, content):
+    ir = make_ir()
+    interpretation = make_interpretation(ir)
+    client = ScriptedPlanningClient([content, json.dumps(make_draft(DocumentFormat.DOCX))])
+    service = PlanningService(LLMService(settings(), client=client), tmp_path)
+
+    with pytest.raises(InvalidPlanResponseError):
+        run(service.create_plan(ir, interpretation, DocumentFormat.DOCX))
+
+    assert len(client.messages) == 1
+
 
 
 def test_mock_mode_returns_marked_empty_plan_without_calling_provider(tmp_path):

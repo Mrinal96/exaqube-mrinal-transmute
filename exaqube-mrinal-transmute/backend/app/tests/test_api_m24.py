@@ -25,6 +25,7 @@ from app.services.interpretation import InterpretationService
 from app.services.llm import LLMService
 from app.services.planning import PlanningService
 from app.services.llm_client import LLMInvalidResponseError, LLMProviderError, OpenAICompatibleClient
+from app.orchestration.engine import WorkflowExecutor
 from app.storage.interpretations import InterpretationStore
 from app.storage.transformations import TransformationStore
 
@@ -281,6 +282,95 @@ def test_provider_error_has_safe_structured_api_response(api, monkeypatch):
     assert len(records) == 1
     import json
     assert json.loads(records[0].read_text(encoding="utf-8"))["status"] == "failed"
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected_code", "expected_message"),
+    [
+        ("tpm", "llm_rate_limit_tpm", "per-minute token"),
+        ("tpd", "llm_rate_limit_tpd", "daily token"),
+        ("rpm", "llm_rate_limit_rpm", "per-minute request"),
+        ("rpd", "llm_rate_limit_rpd", "daily request"),
+        ("quota", "llm_quota_exhausted", "billing limit"),
+    ],
+)
+def test_rate_limit_scope_has_safe_structured_api_error(api, kind, expected_code, expected_message):
+    client, configure, original_settings = api
+    document_id = upload_html(client)
+    provider = StaticClient(
+        is_mock=False,
+        error=LLMProviderError(
+            429,
+            retry_after_seconds=22,
+            rate_limit_kind=kind,
+            provider_error_message="private provider response must not be returned",
+            retryable=kind in {"tpm", "rpm"},
+        ),
+    )
+    settings = Settings(
+        _env_file=None,
+        storage_root=original_settings.storage_root,
+        mock_llm=False,
+        llm_base_url="https://example.test/v1",
+        llm_model="api-test-model",
+        llm_max_attempts=1,
+    )
+    configure(settings, provider)
+    response = client.post(f"/api/documents/{document_id}/interpretations", json={})
+    payload = response.json()["error"]
+    assert response.status_code == 429
+    assert payload["code"] == expected_code
+    assert expected_message in payload["message"].lower()
+    assert payload["details"]["rate_limit_kind"] == kind
+    assert payload["details"]["retry_after_seconds"] == 22
+    assert "private provider response" not in response.text
+    assert provider.calls == 1
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected_code"),
+    [
+        ("tpm", "provider_rate_limit_tpm"),
+        ("tpd", "provider_rate_limit_tpd"),
+        ("rpm", "provider_rate_limit_rpm"),
+        ("rpd", "provider_rate_limit_rpd"),
+        ("quota", "provider_quota_exhausted"),
+    ],
+)
+def test_workflow_error_code_preserves_rate_limit_scope(kind, expected_code):
+    error = LLMProviderError(429, rate_limit_kind=kind, retryable=kind in {"tpm", "rpm"})
+    code, message = WorkflowExecutor._safe_error(error)
+    assert code == expected_code
+    assert message
+
+
+def test_provider_413_has_safe_actionable_api_error(api):
+    client, configure, original_settings = api
+    document_id = upload_html(client)
+    provider = StaticClient(
+        is_mock=False,
+        error=LLMProviderError(
+            413,
+            provider_error_code="request_too_large",
+            provider_error_message="private body detail",
+            retryable=False,
+        ),
+    )
+    settings = Settings(
+        _env_file=None,
+        storage_root=original_settings.storage_root,
+        mock_llm=False,
+        llm_base_url="https://example.test/v1",
+        llm_model="api-test-model",
+        llm_max_attempts=3,
+    )
+    configure(settings, provider)
+    response = client.post(f"/api/documents/{document_id}/interpretations", json={})
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "llm_request_too_large"
+    assert response.json()["error"]["details"] == {"provider_status": 413, "retryable": False}
+    assert "private body detail" not in response.text
+    assert provider.calls == 1
 
 
 def test_malformed_provider_json_maps_to_502_without_retry_and_logs_before_response(api, caplog):
@@ -621,7 +711,7 @@ def test_configured_llm_generates_valid_cited_pptx_artifact(api):
     assert response.status_code == 201, response.text
     body = response.json()
     assert body["output"]["is_mock"] is False
-    assert body["output"]["artifact_schema_version"] == "1.1"
+    assert body["output"]["artifact_schema_version"] == "1.2"
     assert body["usage"] == {"input_tokens": 120, "output_tokens": 80, "total_tokens": 200}
     downloaded = client.get(body["download_url"])
     assert downloaded.status_code == 200
@@ -648,8 +738,8 @@ def test_configured_llm_generates_valid_cited_pptx_artifact(api):
     diagnostics = error["details"]
     assert diagnostics["target_format"] == "pptx"
     assert diagnostics["schema_model"] == "PPTXArtifactContent"
-    assert diagnostics["prompt_version"] == "artifact_v7"
-    assert diagnostics["artifact_schema_version"] == "1.1"
+    assert diagnostics["prompt_version"] == "artifact_v8"
+    assert diagnostics["artifact_schema_version"] == "1.2"
     assert diagnostics["json_parsing_succeeded"] is True
     assert any(
         item["field_path"] == ["undeclared_contract_field"]
@@ -770,6 +860,95 @@ def test_workflow_dag_executes_html_to_interpretation_plan_docx_and_download(api
     assert events.status_code == 200
     assert "event: node_completed" in events.text
     assert "event: run_completed" in events.text
+
+
+def test_truncated_planning_recovery_never_reaches_native_writer(api, monkeypatch):
+    client, configure, default_settings = api
+    document_id = upload_html(client)
+    requests = []
+    writer_calls = []
+
+    async def no_wait(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("app.services.llm_client.asyncio.sleep", no_wait)
+
+    def provider_handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            content = json.dumps({
+                "summary": "The source contains revenue information.",
+                "facts": [], "metrics": [], "entities": [], "claims": [],
+                "relationships": [], "insights": [], "warnings": [],
+            })
+            finish_reason = "stop"
+        else:
+            content = '{"target_format":"docx","output_structure":'
+            finish_reason = "length"
+        return httpx.Response(200, json={
+            "model": "openai/gpt-oss-20b",
+            "choices": [{"message": {"role": "assistant", "content": content}, "finish_reason": finish_reason}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 100, "total_tokens": 200},
+        })
+
+    provider = OpenAICompatibleClient(
+        base_url="https://api.groq.com/openai/v1",
+        model="openai/gpt-oss-20b",
+        api_key="test-only-key",
+        transport=httpx.MockTransport(provider_handler),
+    )
+    configure(Settings(
+        _env_file=None,
+        storage_root=default_settings.storage_root,
+        mock_llm=False,
+        llm_base_url="https://api.groq.com/openai/v1",
+        llm_api_key="test-only-key",
+        llm_model="openai/gpt-oss-20b",
+    ), provider)
+
+    class WriterSpy:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def transform(self, *_args, **_kwargs):
+            writer_calls.append(True)
+
+    monkeypatch.setattr("app.orchestration.engine.ArtifactTransformationService", WriterSpy)
+    definition = client.post("/api/workflows", json={
+        "name": "Truncated planning must block rendering",
+        "nodes": [
+            {"id": "source", "kind": "source", "document_id": document_id, "source_format": "html"},
+            {"id": "interpret", "kind": "interpretation"},
+            {"id": "plan", "kind": "planning", "target_format": "docx"},
+            {"id": "render", "kind": "transformation", "target_format": "docx"},
+            {"id": "output", "kind": "output"},
+        ],
+        "edges": [
+            {"source": "source", "target": "interpret"},
+            {"source": "interpret", "target": "plan"},
+            {"source": "plan", "target": "render"},
+            {"source": "render", "target": "output"},
+        ],
+    })
+    assert definition.status_code == 201, definition.text
+    workflow_id = definition.json()["id"]
+    queued = client.post(f"/api/workflows/{workflow_id}/runs", json={})
+    assert queued.status_code == 202, queued.text
+    run = client.get(f"/api/workflows/{workflow_id}/runs/{queued.json()['run_id']}").json()
+
+    assert run["status"] == "failed"
+    assert run["node_results"]["interpret"]["status"] == "done"
+    assert run["node_results"]["plan"]["status"] == "failed"
+    assert run["node_results"]["plan"]["error_code"] == "llm_output_truncated"
+    assert run["node_results"]["plan"]["usage"] == {
+        "prompt_tokens": 200,
+        "completion_tokens": 200,
+        "total_tokens": 400,
+    }
+    assert run["node_results"]["render"]["status"] == "blocked"
+    assert run["node_results"]["output"]["status"] == "blocked"
+    assert len(requests) == 3  # interpretation, initial planning, one recovery
+    assert writer_calls == []
 
 
 def test_workflow_interpretation_requests_4096_completion_tokens(api, monkeypatch):

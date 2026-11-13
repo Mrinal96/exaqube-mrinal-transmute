@@ -1,6 +1,7 @@
 """Deterministic canonical-IR to Mermaid writer coverage."""
 
 import pytest
+from pydantic import ValidationError
 
 from app.models.documents import DocumentFormat
 from app.models.intermediate import (
@@ -175,11 +176,10 @@ def test_mmd_writer_rejects_source_diagram_when_other_ir_content_would_be_omitte
 
 
 def test_mmd_writer_rejects_relationships_with_missing_entities():
-    source = _ir(relationships=[Relationship(
-        source_entity_id="missing-source", target_entity_id="missing-target", relationship_type="depends_on",
-    )])
-    with pytest.raises(UnsupportedIRContentError, match="absent from the IR entity collection"):
-        render_mmd(source)
+    with pytest.raises(ValidationError, match="unknown entity ID"):
+        _ir(relationships=[Relationship(
+            source_entity_id="missing-source", target_entity_id="missing-target", relationship_type="depends_on",
+        )])
 
 
 def test_mmd_writer_rejects_unsupported_chart_blocks_instead_of_dropping_them():
@@ -192,3 +192,18 @@ def test_mmd_writer_rejects_unsupported_chart_blocks_instead_of_dropping_them():
 def test_mmd_validator_rejects_empty_or_malformed_source(content):
     with pytest.raises(ValueError):
         validate_mmd_output(content)
+
+
+@pytest.mark.parametrize(
+    "diagram, reason",
+    [
+        (b"A --> B\nflowchart TD", "declaration must precede"),
+        (b"flowchart TD\nsubgraph one\nA-->B", "unclosed subgraph"),
+        (b"flowchart TD\nend", "unmatched subgraph end"),
+        (b"flowchart TD\nA\x00B", "control character"),
+        (b"flowchart TD\nsequenceDiagram", "exactly one"),
+    ],
+)
+def test_mmd_validator_rejects_known_structural_errors_without_claiming_full_grammar(diagram, reason):
+    with pytest.raises(ValueError, match=reason):
+        validate_mmd_output(diagram)

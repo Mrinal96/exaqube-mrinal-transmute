@@ -14,7 +14,7 @@ from pydantic import ValidationError
 from app.models.documents import DocumentFormat
 from app.models.intermediate import DocumentIR, IRBlock
 from app.models.interpretation import DocumentInterpretation, SourceReference
-from app.models.llm import LLMCompletionResult
+from app.models.llm import LLMCompletionResult, LLMTokenUsage
 from app.models.transformation import (
     ContentMapping,
     DOCX_PLAN_SCHEMA_VERSION,
@@ -40,10 +40,25 @@ from app.models.transformation import (
 from app.prompts.transformation import build_transformation_messages, prompt_version_for, semantic_source_items
 from app.services.interpretation import SourceReferenceResolver, UnresolvedSourceReferenceError
 from app.services.llm import LLMService
+from app.services.llm_client import LLMTruncatedResponseError
 from app.storage.transformations import TransformationStore
 
 logger = logging.getLogger(__name__)
 MOCK_PLAN_WARNING = "MOCK_LLM or mock interpretation is present; no transformation plan was generated."
+
+
+def _aggregate_token_usage(
+    first: LLMTokenUsage | None,
+    second: LLMTokenUsage | None,
+) -> LLMTokenUsage | None:
+    if first is None and second is None:
+        return None
+    values: dict[str, int | None] = {}
+    for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        left = getattr(first, field) if first else None
+        right = getattr(second, field) if second else None
+        values[field] = (left or 0) + (right or 0) if left is not None or right is not None else None
+    return LLMTokenUsage(**values)
 
 
 @dataclass(frozen=True)
@@ -155,13 +170,62 @@ class PlanningService:
             draft: TransformationPlanDraft | None = None
             if not should_mock:
                 messages = build_transformation_messages(document_ir, interpretation, target, user_instructions)
-                if max_completion_tokens is None:
-                    completion = await self.llm_service.complete(messages)
-                else:
-                    completion = await self.llm_service.complete(
-                        messages,
-                        max_completion_tokens=max_completion_tokens,
+                try:
+                    completion = await self._complete_plan(messages, max_completion_tokens)
+                except LLMTruncatedResponseError as initial_truncation:
+                    recovery_messages = build_transformation_messages(
+                        document_ir,
+                        interpretation,
+                        target,
+                        user_instructions,
+                        compact_recovery=True,
                     )
+                    logger.warning(
+                        "transformation_plan_truncation_recovery_started",
+                        extra={
+                            "document_id": document_ir.document_id,
+                            "target_format": target.value,
+                            "prompt_version": prompt_version,
+                            "requested_max_completion_tokens": max_completion_tokens,
+                            "initial_prompt_bytes": sum(len(message.content.encode("utf-8")) for message in messages),
+                            "recovery_prompt_bytes": sum(len(message.content.encode("utf-8")) for message in recovery_messages),
+                            "recovery_attempt": 1,
+                            "max_recovery_attempts": 1,
+                        },
+                    )
+                    try:
+                        completion = await self._complete_plan(recovery_messages, max_completion_tokens)
+                    except LLMTruncatedResponseError as recovery_truncation:
+                        failed_usage = _aggregate_token_usage(
+                            initial_truncation.operation_usage,
+                            recovery_truncation.operation_usage,
+                        )
+                        logger.error(
+                            "transformation_plan_truncation_recovery_failed",
+                            extra={
+                                "document_id": document_ir.document_id,
+                                "target_format": target.value,
+                                "recovery_attempts": 1,
+                                "failure_category": "truncated_completion",
+                                "prompt_tokens": (
+                                    failed_usage.prompt_tokens if failed_usage else None
+                                ),
+                                "completion_tokens": (
+                                    failed_usage.completion_tokens if failed_usage else None
+                                ),
+                                "total_tokens": failed_usage.total_tokens if failed_usage else None,
+                            },
+                        )
+                        raise LLMTruncatedResponseError(
+                            failed_usage,
+                            recovery_attempted=True,
+                        ) from recovery_truncation
+                    completion = completion.model_copy(update={
+                        "usage": _aggregate_token_usage(
+                            initial_truncation.operation_usage,
+                            completion.usage,
+                        )
+                    })
                 should_mock = completion.is_mock
                 if not should_mock:
                     draft = _parse_plan_draft(completion.content, target)
@@ -229,6 +293,15 @@ class PlanningService:
             reused = saved.plan_id != plan.plan_id
             logger.info("transformation_plan_created", extra={"node_id": document_ir.document_id})
             return StoredPlan(saved, reused)
+
+    async def _complete_plan(
+        self,
+        messages,
+        max_completion_tokens: int | None,
+    ) -> LLMCompletionResult:
+        if max_completion_tokens is None:
+            return await self.llm_service.complete(messages)
+        return await self.llm_service.complete(messages, max_completion_tokens=max_completion_tokens)
 
     def _provider_identity(self, interpretation: DocumentInterpretation) -> dict[str, str | bool]:
         settings = self.llm_service.settings

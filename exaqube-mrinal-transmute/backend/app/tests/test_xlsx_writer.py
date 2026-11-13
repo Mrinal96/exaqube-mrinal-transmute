@@ -44,7 +44,7 @@ def _ir(*, sections=None, blocks=None, entities=None, facts=None, relationships=
 
 def test_xlsx_writer_preserves_sections_tables_formulas_entities_facts_and_provenance():
     location = SourceLocation(sheet_name="Metrics", cell_range="A1:B3")
-    formula_location = SourceLocation(sheet_name="Metrics", cell_range="B3")
+    formula_location = SourceLocation(sheet_name="Metrics", cell_range="B4")
     source = _ir(
         sections=[IRSection(
             id="section-metrics",
@@ -125,8 +125,8 @@ def test_xlsx_writer_preserves_sections_tables_formulas_entities_facts_and_prove
     output = render_xlsx(source)
     validate_xlsx_output(output)
     workbook = load_workbook(BytesIO(output), data_only=False)
-    assert workbook["Metrics"]["B3"].value == "=SUM(B2:B2)"
-    assert workbook["Metrics"]["B3"].data_type == "f"
+    assert workbook["Metrics"]["B4"].value == "=SUM(B2:B2)"
+    assert workbook["Metrics"]["B4"].data_type == "f"
     assert "IRTable1" in workbook["Metrics"].tables
     content_rows = {
         workbook["IR Content"].cell(row, 3).value: row
@@ -212,3 +212,34 @@ def test_xlsx_writer_never_interprets_non_formula_text_as_a_formula(formula):
     assert cell.value == formula
     assert cell.data_type == "s"
     workbook.close()
+
+
+@pytest.mark.parametrize(
+    "blocks, expected",
+    [
+        (
+            [
+                IRBlock(id="table-one", kind="table", table=TableData(headers=["A"], rows=[[1]]), source=SourceLocation(sheet_name="Data", cell_range="A1:A2")),
+                IRBlock(id="table-two", kind="table", table=TableData(headers=["B"], rows=[[2]]), source=SourceLocation(sheet_name="Data", cell_range="A2:A3")),
+            ],
+            "Table blocks table-one and table-two overlap",
+        ),
+        (
+            [
+                IRBlock(id="table", kind="table", table=TableData(headers=["A"], rows=[[1]]), source=SourceLocation(sheet_name="Data", cell_range="A1:A2")),
+                IRBlock(id="formula", kind="formula", text="=1+1", source=SourceLocation(sheet_name="Data", cell_range="A2")),
+            ],
+            "Formula block formula overlaps table block table",
+        ),
+        (
+            [
+                IRBlock(id="formula-one", kind="formula", text="=1+1", source=SourceLocation(sheet_name="Data", cell_range="A1")),
+                IRBlock(id="formula-two", kind="formula", text="=2+2", source=SourceLocation(sheet_name="Data", cell_range="a1")),
+            ],
+            "Formula blocks formula-one and formula-two overlap",
+        ),
+    ],
+)
+def test_xlsx_writer_rejects_overlapping_table_and_formula_placements(blocks, expected):
+    with pytest.raises(UnsupportedIRContentError, match=expected):
+        render_xlsx(_ir(blocks=blocks))

@@ -70,6 +70,9 @@ def render_xlsx(document_ir: DocumentIR) -> bytes:
         raise UnsupportedIRContentError(
             "XLSX writer cannot represent source element(s): " + ", ".join(unsupported) + "."
         )
+    for _, block, _ in tables:
+        _validate_table(block)
+    _validate_source_placements(tables, formulas)
 
     table_names: dict[str, str] = {}
     writer_warnings: list[str] = []
@@ -272,6 +275,69 @@ def _table_anchor(source: SourceLocation, header_count: int, row_count: int) -> 
     if max_col - min_col + 1 != header_count or max_row - min_row + 1 != row_count + 1:
         raise UnsupportedIRContentError("A table source range does not match its preserved rows and headers.")
     return min_row, min_col
+
+
+def _validate_source_placements(tables, formulas) -> None:
+    """Reject overlapping source placements before writing any cell data."""
+    table_ranges: list[tuple[str, str, tuple[int, int, int, int]]] = []
+    for _, block, _ in tables:
+        source = block.source
+        if not source.sheet_name:
+            continue
+        assert block.table is not None
+        _table_anchor(source, len(block.table.headers), len(block.table.rows))
+        if source.cell_range:
+            try:
+                min_col, min_row, max_col, max_row = range_boundaries(source.cell_range)
+            except (TypeError, ValueError) as exc:
+                raise UnsupportedIRContentError(f"Table block {block.id} has an invalid source range.") from exc
+            if None in (min_col, min_row, max_col, max_row):
+                raise UnsupportedIRContentError(f"Table block {block.id} has an incomplete source range.")
+        else:
+            assert block.table is not None
+            min_row, min_col = 1, 1
+            max_row = len(block.table.rows) + 1
+            max_col = len(block.table.headers)
+        current = (min_col, min_row, max_col, max_row)
+        for other_id, other_sheet, other_range in table_ranges:
+            if source.sheet_name.casefold() == other_sheet.casefold() and _ranges_overlap(current, other_range):
+                raise UnsupportedIRContentError(
+                    f"Table blocks {other_id} and {block.id} overlap on source worksheet {source.sheet_name!r}."
+                )
+        table_ranges.append((block.id, source.sheet_name, current))
+
+    formula_cells: dict[tuple[str, str], str] = {}
+    for _, block, _ in formulas:
+        sheet_name = block.source.sheet_name
+        coordinate = _single_cell_coordinate(block.source.cell_range)
+        if not sheet_name or not coordinate:
+            continue
+        min_col, min_row, _, _ = range_boundaries(block.source.cell_range)
+        for table_id, table_sheet, table_range in table_ranges:
+            if sheet_name.casefold() == table_sheet.casefold() and _point_in_range(min_col, min_row, table_range):
+                raise UnsupportedIRContentError(
+                    f"Formula block {block.id} overlaps table block {table_id} at {sheet_name}!{coordinate}."
+                )
+        key = (sheet_name.casefold(), coordinate.upper())
+        if key in formula_cells:
+            raise UnsupportedIRContentError(
+                f"Formula blocks {formula_cells[key]} and {block.id} overlap at {sheet_name}!{coordinate}."
+            )
+        formula_cells[key] = block.id
+
+
+def _ranges_overlap(left: tuple[int, int, int, int], right: tuple[int, int, int, int]) -> bool:
+    left_min_col, left_min_row, left_max_col, left_max_row = left
+    right_min_col, right_min_row, right_max_col, right_max_row = right
+    return not (
+        left_max_col < right_min_col or right_max_col < left_min_col
+        or left_max_row < right_min_row or right_max_row < left_min_row
+    )
+
+
+def _point_in_range(column: int, row: int, bounds: tuple[int, int, int, int]) -> bool:
+    min_col, min_row, max_col, max_row = bounds
+    return min_col <= column <= max_col and min_row <= row <= max_row
 
 
 def _write_table(

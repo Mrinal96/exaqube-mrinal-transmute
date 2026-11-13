@@ -79,8 +79,10 @@ ARTIFACT_CONTRACTS: dict[DocumentFormat, ArtifactContract] = {
             "bullets, metric cards, and tables where supported."
         ),
         planned_guidance=(
-            "Follow the validated HTML section and component plan, include every mapped item, and honor its "
-            "preservation rules and explicit omissions."
+            "Follow the validated HTML page title, include_navigation setting, section order, section_id, heading, "
+            "semantic_element, purpose, and mapping_ids exactly. Return component_order and every component's exact "
+            "component_id and mapping_ids. Use only heading, paragraph, table, list, metric_card, callout, or accordion "
+            "components, preserve all mapping source references, and do not add, omit, reorder, or redirect planned content."
         ),
     ),
     DocumentFormat.DOCX: ArtifactContract(
@@ -94,9 +96,11 @@ ARTIFACT_CONTRACTS: dict[DocumentFormat, ArtifactContract] = {
             "lists, and native tables for supported metrics or tabular data."
         ),
         planned_guidance=(
-            "Use the planned document title and section order exactly; follow each section's purpose and mapping IDs. "
-            "Use paragraphs, lists, metrics, and tables according to each mapping's operation and formatting guidance. "
-            "Include every mapped semantic item and honor explicit omissions."
+            "Use the planned document title and section order exactly. For each section return section_id, heading_level, "
+            "mapping_ids, and element_order exactly as planned. For every planned element, return its exact element_id "
+            "and mapping_ids on its content item; use element_type paragraph/callout/heading for paragraphs, list for "
+            "bullet items, and table for native tables or metric rows. Include every planned mapping and preserve its "
+            "source references. Do not add, omit, reorder, or redirect planned sections or elements."
         ),
     ),
     DocumentFormat.PPTX: ArtifactContract(

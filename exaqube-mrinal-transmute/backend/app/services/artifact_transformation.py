@@ -17,6 +17,7 @@ from app.models.artifacts import (
     ArtifactTable,
     ArtifactText,
     DOCXArtifactContent,
+    DOCXArtifactSection,
     HTMLArtifactContent,
     HTMLArtifactSection,
     PPTXArtifactContent,
@@ -107,14 +108,16 @@ class ArtifactTransformationService:
             raise InvalidArtifactContentError("The transformation plan does not match the source, interpretation, and target format.")
         if native_writer is not None and plan is not None:
             raise UnsupportedIRContentError(
-                f"The deterministic {target_format.value.upper()} writer serializes canonical IR and does not apply transformation plans."
+                f"The deterministic native {target_format.value.upper()} export serializes canonical IR and does not apply semantic transformation plans."
             )
         if native_writer is not None and user_instructions and user_instructions.strip():
             raise UnsupportedIRContentError(
-                f"The deterministic {target_format.value.upper()} writer cannot apply user transformation instructions."
+                f"The deterministic native {target_format.value.upper()} export cannot apply user transformation instructions."
             )
         if target_format == DocumentFormat.PPTX and plan is not None:
             _reject_unsupported_pptx_plan_elements(plan)
+        if target_format == DocumentFormat.HTML and plan is not None:
+            _reject_unsupported_html_plan_elements(plan)
 
         completion = None
         is_mock = False if native_writer is not None else self.llm_service.settings.mock_llm
@@ -156,6 +159,10 @@ class ArtifactTransformationService:
                     raise InvalidArtifactContentError("Generated content cited a source location that does not resolve to the input document.") from exc
                 if target_format == DocumentFormat.PPTX and plan is not None:
                     _validate_pptx_plan_alignment(content, plan)
+                elif target_format == DocumentFormat.DOCX and plan is not None:
+                    _validate_docx_plan_alignment(content, plan)
+                elif target_format == DocumentFormat.HTML and plan is not None:
+                    _validate_html_plan_alignment(content, plan)
 
         try:
             if native_writer is not None:
@@ -562,7 +569,11 @@ def _mock_content(document_ir: DocumentIR, target_format: DocumentFormat):
         html_sections = [_to_html_section(section) for section in sections]
         return HTMLArtifactContent(target_format="html", page_title=title, sections=html_sections)
     if target_format == DocumentFormat.DOCX:
-        return DOCXArtifactContent(target_format="docx", document_title=title, sections=sections)
+        return DOCXArtifactContent(
+            target_format="docx",
+            document_title=title,
+            sections=[DOCXArtifactSection.model_validate(section.model_dump(mode="python")) for section in sections],
+        )
     if target_format == DocumentFormat.PPTX:
         return _mock_pptx_content(document_ir)
     raise UnsupportedArtifactFormatError
@@ -662,6 +673,21 @@ def _reject_unsupported_pptx_plan_elements(plan: TransformationPlan) -> None:
         )
 
 
+def _reject_unsupported_html_plan_elements(plan: TransformationPlan) -> None:
+    from app.models.transformation import HTMLOutputStructure
+
+    structure = plan.output_structure
+    if not isinstance(structure, HTMLOutputStructure):
+        raise InvalidArtifactContentError("The HTML transformation plan has no HTML output structure.")
+    unsupported = [component.component_type for section in structure.sections for component in section.components
+                   if component.component_type in {"chart", "link"}]
+    if unsupported:
+        kinds = ", ".join(sorted(set(unsupported)))
+        raise UnsupportedArtifactElementError(
+            f"HTML plan component(s) are not supported by the current native writer: {kinds}."
+        )
+
+
 def _validate_pptx_plan_alignment(content: PPTXArtifactContent, plan: TransformationPlan) -> None:
     structure = plan.output_structure
     if not isinstance(structure, PPTXOutputStructure):
@@ -733,6 +759,160 @@ def _validate_pptx_plan_alignment(content: PPTXArtifactContent, plan: Transforma
         raise InvalidArtifactContentError("Generated PPTX content repeats a plan mapping ID.")
     if dict(placements) != mapping_destinations or set(seen_ids) != set(mapping_destinations):
         raise InvalidArtifactContentError("Generated PPTX mapping placements do not match the validated plan.")
+
+
+def _validate_docx_plan_alignment(content: DOCXArtifactContent, plan: TransformationPlan) -> None:
+    from app.models.transformation import DOCXOutputStructure
+
+    structure = plan.output_structure
+    if not isinstance(structure, DOCXOutputStructure):
+        raise InvalidArtifactContentError("The DOCX transformation plan has no DOCX output structure.")
+    planned_by_id = {section.section_id: section for section in structure.sections}
+    if [section.section_id for section in content.sections] != [section.section_id for section in structure.sections]:
+        raise InvalidArtifactContentError("Generated DOCX sections or their ordering do not match the validated plan.")
+    mapping_destinations = _mapping_destinations(plan)
+    for section in content.sections:
+        planned = planned_by_id[section.section_id]
+        if section.heading != planned.title or section.heading_level != planned.heading_level:
+            raise InvalidArtifactContentError("Generated DOCX section heading or hierarchy does not match the validated plan.")
+        expected_section_mappings = mapping_destinations.get(("doc_section", section.section_id), [])
+        if section.mapping_ids != expected_section_mappings:
+            raise InvalidArtifactContentError("Generated DOCX section mappings do not match their declared destinations.")
+        items, section_items = _docx_items_by_id(section)
+        expected_element_ids = [element.element_id for element in planned.elements]
+        if section.element_order != expected_element_ids or set(items) != set(expected_element_ids):
+            raise InvalidArtifactContentError("Generated DOCX elements or their ordering do not match the validated plan.")
+        section_item_mapping_ids = [mapping_id for item in section_items for mapping_id in item.mapping_ids]
+        if len(section_item_mapping_ids) != len(set(section_item_mapping_ids)) or set(section_item_mapping_ids) != set(expected_section_mappings):
+            raise InvalidArtifactContentError("Generated DOCX section-level content mappings do not match their declared destinations.")
+        for element in planned.elements:
+            item_kind, item = items[element.element_id]
+            expected_kinds = {
+                "heading": {"paragraph_heading"},
+                "paragraph": {"paragraph"},
+                "callout": {"callout"},
+                "list": {"bullet"},
+                "table": {"table", "metric"},
+            }[element.element_type]
+            actual_kind = (
+                "paragraph_heading" if item_kind == "paragraph" and item.element_type == "heading"
+                else "list" if item_kind == "bullet"
+                else item.element_type if item_kind == "paragraph"
+                else item_kind
+            )
+            if actual_kind not in expected_kinds:
+                raise InvalidArtifactContentError("Generated DOCX element types do not match the validated plan.")
+            target = ("doc_element", element.element_id)
+            expected_mapping_ids = mapping_destinations.get(target, [])
+            if item.mapping_ids != expected_mapping_ids:
+                raise InvalidArtifactContentError("Generated DOCX element mappings do not match their declared destinations.")
+            _validate_item_mapping_references(plan, item.mapping_ids, _item_references(item))
+        section_references = [reference for item in items.values() for reference in _item_references(item[1])]
+        section_references.extend(reference for item in section_items for reference in _item_references(item))
+        _validate_item_mapping_references(plan, section.mapping_ids, section_references)
+
+
+def _validate_html_plan_alignment(content: HTMLArtifactContent, plan: TransformationPlan) -> None:
+    from app.models.transformation import HTMLOutputStructure
+
+    structure = plan.output_structure
+    if not isinstance(structure, HTMLOutputStructure):
+        raise InvalidArtifactContentError("The HTML transformation plan has no HTML output structure.")
+    if content.page_title != structure.page_title or content.include_navigation != structure.include_navigation:
+        raise InvalidArtifactContentError("Generated HTML title or navigation configuration does not match the validated plan.")
+    if [section.section_id for section in content.sections] != [section.section_id for section in structure.sections]:
+        raise InvalidArtifactContentError("Generated HTML sections or their ordering do not match the validated plan.")
+    mapping_destinations = _mapping_destinations(plan)
+    for section, planned in zip(content.sections, structure.sections, strict=True):
+        if (
+            section.heading != planned.heading
+            or section.semantic_element != planned.semantic_element
+            or section.purpose != planned.purpose
+        ):
+            raise InvalidArtifactContentError("Generated HTML section semantics do not match the validated plan.")
+        if section.mapping_ids != mapping_destinations.get(("html_section", planned.section_id), []):
+            raise InvalidArtifactContentError("Generated HTML section mappings do not match their declared destinations.")
+        items, section_items = _html_items_by_id(section)
+        expected_ids = [component.component_id for component in planned.components]
+        if section.component_order != expected_ids or set(items) != set(expected_ids):
+            raise InvalidArtifactContentError("Generated HTML components or their ordering do not match the validated plan.")
+        expected_section_mappings = mapping_destinations.get(("html_section", planned.section_id), [])
+        section_item_mapping_ids = [mapping_id for item in section_items for mapping_id in item.mapping_ids]
+        if len(section_item_mapping_ids) != len(set(section_item_mapping_ids)) or set(section_item_mapping_ids) != set(expected_section_mappings):
+            raise InvalidArtifactContentError("Generated HTML section-level content mappings do not match their declared destinations.")
+        for component in planned.components:
+            item_kind, item, output_type = items[component.component_id]
+            if output_type != component.component_type:
+                raise InvalidArtifactContentError("Generated HTML component types do not match the validated plan.")
+            expected_mapping_ids = mapping_destinations.get(("html_component", component.component_id), [])
+            if item.mapping_ids != expected_mapping_ids:
+                raise InvalidArtifactContentError("Generated HTML component mappings do not match their declared destinations.")
+            _validate_item_mapping_references(plan, item.mapping_ids, _item_references(item))
+        section_references = [reference for _, item, _ in items.values() for reference in _item_references(item)]
+        section_references.extend(reference for item in section_items for reference in _item_references(item))
+        _validate_item_mapping_references(plan, section.mapping_ids, section_references)
+
+
+def _mapping_destinations(plan: TransformationPlan) -> dict[tuple[str, str], list[str]]:
+    destinations: dict[tuple[str, str], list[str]] = {}
+    for mapping in plan.content_mappings:
+        key = (mapping.destination.target_type, mapping.destination.target_id)
+        destinations.setdefault(key, []).append(mapping.mapping_id)
+    return destinations
+
+
+def _docx_items_by_id(section: DOCXArtifactSection):
+    result = {}
+    section_items = []
+    for kind, collection in (("paragraph", section.paragraphs), ("bullet", section.bullet_points), ("metric", section.metrics), ("table", section.tables)):
+        for item in collection:
+            if item.element_id is None:
+                if not item.mapping_ids:
+                    raise InvalidArtifactContentError("Generated DOCX section-level content must carry its mapping IDs.")
+                section_items.append(item)
+                continue
+            if item.element_id in result:
+                raise InvalidArtifactContentError("Generated DOCX content has a missing or duplicate element ID.")
+            result[item.element_id] = (kind, item)
+    return result, section_items
+
+
+def _html_items_by_id(section: HTMLArtifactSection):
+    result = {}
+    section_items = []
+    for kind, collection, component_type in (
+        ("text", section.paragraphs, None),
+        ("text", section.bullet_points, "list"),
+        ("metric", section.metrics, "metric_card"),
+        ("table", section.tables, "table"),
+    ):
+        for item in collection:
+            if item.element_id is None:
+                if not item.mapping_ids:
+                    raise InvalidArtifactContentError("Generated HTML section-level content must carry its mapping IDs.")
+                section_items.append(item)
+                continue
+            if item.element_id in result:
+                raise InvalidArtifactContentError("Generated HTML content has a missing or duplicate component ID.")
+            result[item.element_id] = (kind, item, component_type or item.element_type)
+    return result, section_items
+
+
+def _item_references(item):
+    if isinstance(item, ArtifactText):
+        return item.source_references
+    return item.source_references
+
+
+def _validate_item_mapping_references(plan: TransformationPlan, mapping_ids: list[str], references) -> None:
+    reference_keys = {_reference_fingerprint(reference) for reference in references}
+    mappings = {mapping.mapping_id: mapping for mapping in plan.content_mappings}
+    for mapping_id in mapping_ids:
+        mapping = mappings.get(mapping_id)
+        if mapping is None or not {
+            _reference_fingerprint(reference) for reference in mapping.source_references
+        }.issubset(reference_keys):
+            raise InvalidArtifactContentError("Generated content did not preserve the source references for its plan mapping.")
 
 
 def _reference_fingerprint(reference: SourceReference) -> str:

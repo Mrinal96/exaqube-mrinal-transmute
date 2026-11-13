@@ -142,10 +142,39 @@ def validate_mmd_output(content: bytes) -> None:
         raise ValueError("The rendered Mermaid source is not valid UTF-8.") from exc
     if not text.strip() or _DECLARATION.search(text) is None:
         raise ValueError("The rendered Mermaid source has no recognized diagram declaration.")
-    diagram_lines = [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("%%")]
-    if diagram_lines and re.match(r"^(?:flowchart|graph)\s+(?:TB|TD|BT|RL|LR)\b", diagram_lines[0], re.IGNORECASE) is None:
+    if any(ord(char) < 32 and char not in "\r\n\t" for char in text):
+        raise ValueError("Mermaid source contains a disallowed control character.")
+    diagram_lines = _meaningful_diagram_lines(text)
+    if not diagram_lines or _DECLARATION.match(diagram_lines[0]) is None:
+        raise ValueError("A Mermaid diagram declaration must precede diagram statements.")
+    declaration_count = sum(1 for line in diagram_lines if _DECLARATION.match(line))
+    if declaration_count != 1:
+        raise ValueError("Mermaid source must contain exactly one top-level diagram declaration.")
+    if re.match(r"^(?:flowchart|graph)\s+(?:TB|TD|BT|RL|LR)\b", diagram_lines[0], re.IGNORECASE) is None:
         if re.match(r"^(?:flowchart|graph)\b", diagram_lines[0], re.IGNORECASE):
             raise ValueError("A Mermaid flowchart declaration must include a valid direction.")
+    subgraphs = 0
+    for line in diagram_lines[1:]:
+        if re.match(r"^subgraph(?:\s|$)", line, re.IGNORECASE):
+            subgraphs += 1
+        elif re.match(r"^end(?:\s|$)", line, re.IGNORECASE):
+            if subgraphs == 0:
+                raise ValueError("Mermaid source contains an unmatched subgraph end.")
+            subgraphs -= 1
+    if subgraphs:
+        raise ValueError("Mermaid source contains an unclosed subgraph.")
+
+
+def _meaningful_diagram_lines(text: str) -> list[str]:
+    lines = [line.strip() for line in text.splitlines()]
+    meaningful = [line for line in lines if line and not line.startswith("%%")]
+    if meaningful and meaningful[0] == "---":
+        try:
+            closing = meaningful.index("---", 1)
+        except ValueError as exc:
+            raise ValueError("Mermaid frontmatter is not closed.") from exc
+        meaningful = meaningful[closing + 1:]
+    return meaningful
 
 
 def _validated_ir(document_ir: DocumentIR) -> DocumentIR:

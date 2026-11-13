@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import time
 
 import httpx
 import pytest
@@ -21,6 +22,7 @@ from app.services.llm_client import (
     LLMTimeoutError,
     OpenAICompatibleClient,
     normalize_chat_completions_url,
+    _parse_provider_duration,
 )
 
 
@@ -158,6 +160,7 @@ def test_groq_gpt_oss_20b_workflow_budget_is_sent_and_kept_within_tpm_headroom()
         sum(len(message.content.encode("utf-8")) for message in messages)
     )
     assert captured["body"]["max_completion_tokens"] == 4096
+    assert captured["body"]["reasoning_effort"] == "low"
     assert "max_tokens" not in captured["body"]
     assert (
         estimated_prompt_tokens
@@ -165,6 +168,47 @@ def test_groq_gpt_oss_20b_workflow_budget_is_sent_and_kept_within_tpm_headroom()
         + client.GROQ_PROMPT_ESTIMATE_SAFETY_TOKENS
         <= client.GROQ_TPM_LIMIT
     )
+
+
+def test_groq_gpt_oss_20b_default_completion_budget_is_explicit_and_reserved():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        captured["reserved"] = sum(client._tpm_reservations.values())
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatibleClient(
+        base_url="https://api.groq.com/openai/v1",
+        model="openai/gpt-oss-20b",
+        transport=httpx.MockTransport(handler),
+    )
+    run(_complete_with_budget_and_close(client, None))
+    assert captured["body"]["max_completion_tokens"] == client.GROQ_GPT_OSS_20B_DEFAULT_COMPLETION_TOKENS
+    assert captured["reserved"] >= captured["body"]["max_completion_tokens"]
+    assert client._tpm_reservations == {}
+
+
+def test_groq_model_output_ceiling_is_separate_from_tpm_headroom(caplog):
+    caplog.set_level(logging.INFO, logger="app.services.llm_client")
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})
+
+    client = OpenAICompatibleClient(
+        base_url="https://api.groq.com/openai/v1",
+        model="openai/gpt-oss-20b",
+        transport=httpx.MockTransport(handler),
+    )
+    run(_complete_with_budget_and_close(client, 70_000))
+    record = next(record for record in caplog.records if record.msg == "llm_provider_request_metadata")
+    assert record.requested_max_completion_tokens == 70_000
+    assert record.model_max_completion_tokens == 65_536
+    assert record.effective_requested_completion_tokens == 65_536
+    assert captured["body"]["max_completion_tokens"] < 65_536
+    assert record.completion_budget_includes_reasoning is True
 
 
 def test_groq_gpt_oss_20b_workflow_budget_clamps_for_large_prompts():
@@ -195,6 +239,7 @@ def test_groq_gpt_oss_20b_workflow_budget_clamps_for_large_prompts():
 
 
 def test_groq_20b_logs_exact_conservative_outgoing_budget_for_long_prompt(caplog):
+    caplog.set_level(logging.INFO, logger="app.services.llm_client")
     captured = {}
     long_messages = [LLMRequestMessage(role="user", content="structured planning input " * 700)]
 
@@ -264,14 +309,48 @@ def test_groq_20b_waits_for_tracked_tpm_reset_before_next_workflow_call(monkeypa
 
     async def call_interpret_then_plan():
         await client.complete([LLMRequestMessage(role="user", content="interpretation")], max_completion_tokens=4096)
-        planning_messages = [LLMRequestMessage(role="user", content="planning input " * 1000)]
+        planning_messages = [LLMRequestMessage(role="user", content="planning input " * 60)]
         await client.complete(planning_messages, max_completion_tokens=4096)
         await client.aclose()
 
     run(call_interpret_then_plan())
     assert len(captured) == 2
     assert waits and waits[0] >= 50
-    assert captured[1]["max_completion_tokens"] <= 4096
+    assert captured[1]["max_completion_tokens"] == 4096
+
+
+def test_completion_budget_is_recalculated_after_reset_from_fresh_capacity(monkeypatch):
+    captured = []
+    waits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        if len(captured) == 1:
+            return httpx.Response(200, headers={
+                "x-ratelimit-limit-tokens": "8000",
+                "x-ratelimit-remaining-tokens": "4000",
+                "x-ratelimit-reset-tokens": "12s",
+            }, json={"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})
+
+    async def no_wait(delay: float) -> None:
+        waits.append(delay)
+
+    monkeypatch.setattr("app.services.llm_client.asyncio.sleep", no_wait)
+    client = OpenAICompatibleClient(
+        base_url="https://api.groq.com/openai/v1",
+        model="openai/gpt-oss-20b",
+        transport=httpx.MockTransport(handler),
+    )
+
+    async def run_requests():
+        await client.complete([LLMRequestMessage(role="user", content="first")], max_completion_tokens=4096)
+        await client.complete([LLMRequestMessage(role="user", content="planning " * 60)], max_completion_tokens=4096)
+        await client.aclose()
+
+    run(run_requests())
+    assert waits and waits[0] >= 12
+    assert captured[1]["max_completion_tokens"] == 4096
 
 
 def test_length_finish_reason_is_classified_as_truncated_before_json_validation(caplog):
@@ -508,7 +587,12 @@ def test_provider_response_metadata_is_logged_without_response_content(caplog):
                         "tool_calls": [],
                     },
                 }],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                    "completion_tokens_details": {"reasoning_tokens": 1},
+                },
             },
         )
 
@@ -531,6 +615,7 @@ def test_provider_response_metadata_is_logged_without_response_content(caplog):
     assert record.prompt_tokens == 1
     assert record.completion_tokens == 1
     assert record.total_tokens == 2
+    assert record.reasoning_tokens == 1
     assert secret_response_text not in caplog.text
     assert "private reasoning" not in caplog.text
     serialized = json.loads(JsonFormatter().format(record))
@@ -539,6 +624,7 @@ def test_provider_response_metadata_is_logged_without_response_content(caplog):
     assert serialized["finish_reason"] == "stop"
     assert serialized["prompt_tokens"] == 1
     assert serialized["total_tokens"] == 2
+    assert serialized["reasoning_tokens"] == 1
     assert secret_response_text not in json.dumps(serialized)
 
 
@@ -643,7 +729,7 @@ def test_rate_limit_error_metadata_is_safely_logged(error_type, message, headers
     assert error.provider_error_code == "rate_limit_exceeded"
     assert error.provider_error_type == error_type
     assert error.retry_after_seconds == (0.25 if expected_kind == "rpm" else None)
-    assert error.rate_limit_reset_seconds == (1.2 if expected_kind == "rpm" else 62.5)
+    assert error.rate_limit_reset_seconds == (None if expected_kind == "rpm" else 62.5)
     assert error.selected_retry_delay_seconds == (0.25 if expected_kind == "rpm" else 62.5)
     record = next(record for record in caplog.records if record.getMessage().startswith("llm_provider_http_error"))
     assert record.http_status == 429
@@ -656,6 +742,277 @@ def test_rate_limit_error_metadata_is_safely_logged(error_type, message, headers
     assert structured["provider_error_message"] == record.provider_error_message
     assert structured["rate_limit_headers"]
     assert "gsk_sensitive_value" not in json.dumps(structured)
+
+
+@pytest.mark.parametrize(
+    ("error_type", "code", "message", "headers", "expected_kind", "retryable"),
+    [
+        ("tokens", "rate_limit_exceeded", "tokens per minute limit reached", {}, "tpm", True),
+        ("tokens", "rate_limit_exceeded", "tokens per day limit reached", {}, "tpd", False),
+        ("requests", "rate_limit_exceeded", "requests per minute limit reached", {}, "rpm", True),
+        (
+            "requests", "rate_limit_exceeded", "request limit reached",
+            {"x-ratelimit-limit-requests": "1000", "x-ratelimit-remaining-requests": "0", "x-ratelimit-reset-requests": "2m59.56s"},
+            "rpd", False,
+        ),
+        ("insufficient_quota", "insufficient_quota", "billing quota exhausted", {}, "quota", False),
+    ],
+)
+def test_rate_limit_scope_classification_distinguishes_minute_daily_and_quota(
+    error_type, code, message, headers, expected_kind, retryable,
+):
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers=headers, json={
+            "error": {"type": error_type, "code": code, "message": message},
+        })
+
+    client = OpenAICompatibleClient(
+        base_url="https://llm.example.test/v1", model="test-model", transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(LLMProviderError) as error_info:
+        run(_complete_and_close(client))
+    assert error_info.value.rate_limit_kind == expected_kind
+    assert error_info.value.retryable is retryable
+    assert error_info.value.status_code == 429
+
+
+@pytest.mark.parametrize(("raw", "seconds"), [("7.66s", 7.66), ("2m59.56s", 179.56)])
+def test_groq_decimal_and_compound_reset_durations(raw, seconds):
+    assert _parse_provider_duration(raw) == pytest.approx(seconds)
+
+
+@pytest.mark.parametrize(
+    ("kind", "error_type", "message", "headers"),
+    [
+        ("tpd", "tokens", "Tokens per day limit reached", {}),
+        (
+            "rpd", "requests", "Requests per day limit reached",
+            {"x-ratelimit-remaining-requests": "0", "x-ratelimit-reset-requests": "2m59.56s"},
+        ),
+        ("quota", "insufficient_quota", "Billing quota exhausted", {}),
+    ],
+)
+def test_daily_limits_and_billing_fail_without_application_retry(kind, error_type, message, headers):
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(429, headers=headers, json={
+            "error": {"type": error_type, "code": "rate_limit_exceeded", "message": message},
+        })
+
+    client = OpenAICompatibleClient(
+        base_url="https://api.groq.com/openai/v1", model="test-model", transport=httpx.MockTransport(handler),
+    )
+    service = LLMService(make_settings(llm_max_attempts=4), client=client)
+    with pytest.raises(LLMProviderError) as error_info:
+        run(_service_complete_and_close(service))
+    assert error_info.value.rate_limit_kind == kind
+    assert error_info.value.retryable is False
+    assert calls == 1
+
+
+def test_groq_request_headers_are_classified_as_rpd_not_rpm():
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={
+            "x-ratelimit-limit-requests": "1000",
+            "x-ratelimit-remaining-requests": "0",
+            "x-ratelimit-reset-requests": "2m59.56s",
+        }, json={"error": {"type": "requests", "code": "rate_limit_exceeded", "message": "Request limit reached."}})
+
+    client = OpenAICompatibleClient(
+        base_url="https://api.groq.com/openai/v1", model="test-model", transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(LLMProviderError) as error_info:
+        run(_complete_and_close(client))
+    assert error_info.value.rate_limit_kind == "rpd"
+    assert error_info.value.retryable is False
+    assert error_info.value.rate_limit_reset_seconds == pytest.approx(179.56)
+
+
+def test_dynamic_tpm_limit_header_replaces_fallback_limit(caplog):
+    caplog.set_level(logging.INFO, logger="app.services.llm_client")
+    bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        headers = {}
+        if len(bodies) == 1:
+            headers = {
+                "x-ratelimit-limit-tokens": "5000",
+                "x-ratelimit-remaining-tokens": "5000",
+                "x-ratelimit-reset-tokens": "90s",
+            }
+        return httpx.Response(200, headers=headers, json={
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        })
+
+    client = OpenAICompatibleClient(
+        base_url="https://api.groq.com/openai/v1", model="openai/gpt-oss-20b", transport=httpx.MockTransport(handler),
+    )
+
+    async def make_calls():
+        await client.complete(MESSAGES, max_completion_tokens=100)
+        await client.complete(MESSAGES, max_completion_tokens=6000)
+        await client.aclose()
+
+    run(make_calls())
+    assert client._tpm_limit_tokens == client.GROQ_TPM_LIMIT  # second response omitted headers; fallback restored
+    # Prompt estimate is small, but the provider's dynamically advertised 5K
+    # window caps this request below the 6K caller request.
+    assert bodies[1]["max_completion_tokens"] == 4729
+    request_logs = [record for record in caplog.records if record.msg == "llm_provider_request_metadata"]
+    assert request_logs[1].tpm_limit_tokens == 5000
+
+
+def test_missing_or_malformed_window_headers_clear_stale_snapshot():
+    call_number = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal call_number
+        call_number += 1
+        if call_number == 1:
+            headers = {
+                "x-ratelimit-limit-tokens": "6000",
+                "x-ratelimit-remaining-tokens": "1000",
+                "x-ratelimit-reset-tokens": "40s",
+            }
+        else:
+            headers = {"x-ratelimit-remaining-tokens": "not-a-number", "x-ratelimit-reset-tokens": "bad"}
+        return httpx.Response(200, headers=headers, json={
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        })
+
+    client = OpenAICompatibleClient(
+        base_url="https://api.groq.com/openai/v1", model="openai/gpt-oss-20b", transport=httpx.MockTransport(handler),
+    )
+
+    async def calls():
+        await client.complete(MESSAGES, max_completion_tokens=100)
+        assert client._tpm_remaining_tokens == 1000
+        await client.complete(MESSAGES, max_completion_tokens=100)
+        await client.aclose()
+
+    run(calls())
+    assert client._tpm_remaining_tokens is None
+    assert client._tpm_reset_at is not None  # locally reconciled usage expires safely
+    assert client._tpm_local_used_tokens >= 15
+
+
+def test_waiting_for_reset_does_not_clear_a_newer_concurrent_header_snapshot(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger="app.services.llm_client")
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatibleClient(
+        base_url="https://api.groq.com/openai/v1",
+        model="openai/gpt-oss-20b",
+        transport=httpx.MockTransport(handler),
+    )
+    client._tpm_limit_tokens = 8000
+    client._tpm_remaining_tokens = 100
+    client._tpm_reset_at = time.monotonic() + 5
+
+    async def wait_and_receive_new_headers(_delay):
+        client._tpm_remaining_tokens = 7000
+        client._tpm_reset_at += 50
+
+    monkeypatch.setattr("app.services.llm_client.asyncio.sleep", wait_and_receive_new_headers)
+    run(_complete_with_budget_and_close(client, 100))
+    request_log = next(record for record in caplog.records if record.msg == "llm_provider_request_metadata")
+    assert request_log.tpm_window_remaining_tokens == 7000
+    assert captured["body"]["max_completion_tokens"] == 100
+
+
+def test_concurrent_requests_reserve_tpm_capacity_before_dispatch():
+    class ConcurrentTransport(httpx.AsyncBaseTransport):
+        def __init__(self):
+            self.started = 0
+            self.bodies = []
+            self.release = asyncio.Event()
+            self.both_started = asyncio.Event()
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            self.bodies.append(json.loads(request.content))
+            self.started += 1
+            if self.started == 2:
+                self.both_started.set()
+            await self.release.wait()
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            })
+
+    transport = ConcurrentTransport()
+    client = OpenAICompatibleClient(
+        base_url="https://api.groq.com/openai/v1", model="openai/gpt-oss-20b", transport=transport,
+    )
+
+    async def run_concurrent():
+        first = asyncio.create_task(client.complete(MESSAGES, max_completion_tokens=4096))
+        second = asyncio.create_task(client.complete(MESSAGES, max_completion_tokens=4096))
+        await asyncio.wait_for(transport.both_started.wait(), timeout=2)
+        reserved_before_response = sum(client._tpm_reservations.values())
+        budgets = [body["max_completion_tokens"] for body in transport.bodies]
+        transport.release.set()
+        await asyncio.gather(first, second)
+        await client.aclose()
+        return reserved_before_response, budgets
+
+    reserved, budgets = run(run_concurrent())
+    assert reserved <= client.GROQ_TPM_LIMIT
+    assert len(budgets) == 2
+    assert sum(budgets) + 2 * client.GROQ_PROMPT_ESTIMATE_SAFETY_TOKENS <= client.GROQ_TPM_LIMIT
+    assert client._tpm_reservations == {}
+
+
+def test_cancellation_and_transport_failure_reconcile_tpm_reservations():
+    class BlockingTransport(httpx.AsyncBaseTransport):
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            self.started.set()
+            await self.release.wait()
+            return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    transport = BlockingTransport()
+    client = OpenAICompatibleClient(
+        base_url="https://api.groq.com/openai/v1", model="openai/gpt-oss-20b", transport=transport,
+    )
+
+    async def cancel_request():
+        task = asyncio.create_task(client.complete(MESSAGES, max_completion_tokens=100))
+        await transport.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert client._tpm_reservations == {}
+        assert client._tpm_local_used_tokens > 0
+        await client.aclose()
+
+    run(cancel_request())
+
+    failed_client = OpenAICompatibleClient(
+        base_url="https://api.groq.com/openai/v1",
+        model="openai/gpt-oss-20b",
+        transport=httpx.MockTransport(lambda _: (_ for _ in ()).throw(httpx.ConnectError("offline"))),
+    )
+
+    async def fail_request():
+        with pytest.raises(LLMConnectionError):
+            await failed_client.complete(MESSAGES, max_completion_tokens=100)
+        assert failed_client._tpm_reservations == {}
+        assert failed_client._tpm_local_used_tokens > 0
+        await failed_client.aclose()
+
+    run(fail_request())
 
 
 def _groq_tpm_limit_response() -> httpx.Response:
@@ -969,7 +1326,7 @@ def test_service_retries_transient_rate_limit_and_logs_attempt_and_delay(monkeyp
         calls += 1
         if calls == 1:
             return httpx.Response(429, headers={"Retry-After": "0"}, json={
-                "error": {"type": "requests", "code": "rate_limit_exceeded", "message": "Request rate limit reached."},
+                "error": {"type": "requests", "code": "rate_limit_exceeded", "message": "Request rate limit reached per minute."},
             })
         return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
 
@@ -1119,6 +1476,13 @@ def _raise(error: Exception):
 async def _complete_and_close(client: OpenAICompatibleClient):
     try:
         return await client.complete(MESSAGES)
+    finally:
+        await client.aclose()
+
+
+async def _complete_with_budget_and_close(client: OpenAICompatibleClient, budget: int):
+    try:
+        return await client.complete(MESSAGES, max_completion_tokens=budget)
     finally:
         await client.aclose()
 

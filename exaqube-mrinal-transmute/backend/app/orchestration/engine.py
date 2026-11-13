@@ -26,7 +26,7 @@ from app.services.artifact_transformation import (
 from app.services.native_writer_errors import UnsupportedIRContentError
 from app.services.artifact_contracts import ArtifactContractConfigurationError
 from app.services.interpretation import InterpretationService
-from app.services.llm_client import LLMProviderError
+from app.services.llm_client import LLMProviderError, LLMTruncatedResponseError
 from app.services.planning import PlanningService
 from app.storage.artifacts import ArtifactStore
 from app.storage.interpretations import InterpretationStore
@@ -128,6 +128,9 @@ class WorkflowExecutor:
             except Exception as exc:
                 result.status = "failed"
                 result.error_code, result.error_message = self._safe_error(exc)
+                failed_usage = getattr(exc, "operation_usage", None)
+                if failed_usage is not None:
+                    result.usage = failed_usage
                 result.finished_at = datetime.now(timezone.utc)
                 logger.error(
                     "workflow_node_failed",
@@ -261,6 +264,16 @@ class WorkflowExecutor:
 
     @staticmethod
     def _safe_error(exc: Exception) -> tuple[str, str]:
+        if isinstance(exc, LLMTruncatedResponseError):
+            if exc.recovery_attempted:
+                return (
+                    "llm_output_truncated",
+                    "The planning response remained incomplete after one compact recovery attempt. Reduce source size or simplify target instructions.",
+                )
+            return (
+                "llm_output_truncated",
+                "The provider truncated its structured response. Reduce source size or simplify target instructions.",
+            )
         if isinstance(exc, ArtifactContractConfigurationError):
             return "artifact_contract_unavailable", "Artifact generation is not configured for this target format."
         if isinstance(exc, UnsupportedArtifactFormatError):
@@ -270,6 +283,18 @@ class WorkflowExecutor:
         if isinstance(exc, UnsupportedIRContentError):
             return "unsupported_ir_content", "The canonical IR contains content this native writer cannot safely represent."
         if isinstance(exc, LLMProviderError):
+            if exc.rate_limit_kind == "tpd":
+                return "provider_rate_limit_tpd", "The provider's daily token allowance is exhausted. Retry after the daily limit resets."
+            if exc.rate_limit_kind == "rpd":
+                return "provider_rate_limit_rpd", "The provider's daily request allowance is exhausted. Retry after the daily limit resets."
+            if exc.rate_limit_kind == "quota":
+                return "provider_quota_exhausted", "The provider account quota or billing limit is exhausted."
+            if exc.rate_limit_kind == "tpm":
+                return "provider_rate_limit_tpm", "The provider's per-minute token limit was reached. Retry after the token window resets."
+            if exc.rate_limit_kind == "rpm":
+                return "provider_rate_limit_rpm", "The provider's per-minute request limit was reached. Retry after the request window resets."
+            if exc.status_code == 413:
+                return "provider_request_too_large", "The provider rejected this request as too large. Reduce the input or request budget."
             return "provider_error", "The configured model provider could not complete this node."
         if isinstance(exc, ValueError):
             message = str(exc)

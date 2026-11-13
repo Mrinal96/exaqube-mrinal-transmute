@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, field
 from app.models.documents import DocumentFormat
 from app.models.interpretation import MetricValue, SourceReference
 
-ARTIFACT_SCHEMA_VERSION = "1.1"
+ARTIFACT_SCHEMA_VERSION = "1.2"
 
 
 class ArtifactText(BaseModel):
@@ -46,6 +46,25 @@ class ArtifactTable(BaseModel):
         return self
 
 
+class PlannedArtifactText(ArtifactText):
+    """HTML/DOCX content item with a plan identity; PPTX keeps its own element contract."""
+
+    element_id: str | None = None
+    element_type: Literal["paragraph", "list", "callout", "heading", "accordion"] | None = None
+    label: str | None = None
+    mapping_ids: list[str] = Field(default_factory=list)
+
+
+class PlannedArtifactMetric(ArtifactMetric):
+    element_id: str | None = None
+    mapping_ids: list[str] = Field(default_factory=list)
+
+
+class PlannedArtifactTable(ArtifactTable):
+    element_id: str | None = None
+    mapping_ids: list[str] = Field(default_factory=list)
+
+
 class ArtifactSection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -57,10 +76,25 @@ class ArtifactSection(BaseModel):
 
 
 class HTMLArtifactSection(ArtifactSection):
+    paragraphs: list[PlannedArtifactText] = Field(default_factory=list)
+    bullet_points: list[PlannedArtifactText] = Field(default_factory=list)
+    metrics: list[PlannedArtifactMetric] = Field(default_factory=list)
+    tables: list[PlannedArtifactTable] = Field(default_factory=list)
+    section_id: str | None = None
+    semantic_element: Literal["main", "section", "article", "aside", "nav", "footer"] = "section"
+    purpose: str | None = None
+    mapping_ids: list[str] = Field(default_factory=list)
+    component_order: list[str] = Field(default_factory=list)
+
     @model_validator(mode="after")
     def section_has_content(self) -> "HTMLArtifactSection":
         if not (self.paragraphs or self.bullet_points or self.metrics or self.tables):
             raise ValueError("An HTML artifact section must contain source-backed content.")
+        _validate_output_order(
+            self.component_order,
+            [item.element_id for item in (*self.paragraphs, *self.bullet_points, *self.metrics, *self.tables)],
+            "HTML component",
+        )
         return self
 
 
@@ -69,7 +103,39 @@ class HTMLArtifactContent(BaseModel):
 
     target_format: Literal["html"]
     page_title: str = Field(min_length=1)
+    include_navigation: bool = True
     sections: list[HTMLArtifactSection] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def section_ids_are_unique(self) -> "HTMLArtifactContent":
+        ids = [section.section_id for section in self.sections if section.section_id is not None]
+        if len(ids) != len(set(ids)):
+            raise ValueError("HTML artifact section IDs must be unique.")
+        if sum(section.semantic_element == "main" for section in self.sections) > 1:
+            raise ValueError("An HTML artifact may declare at most one main semantic section.")
+        if any(section.semantic_element == "main" for section in self.sections) and len(self.sections) > 1:
+            raise ValueError("A main semantic section must be the only top-level HTML artifact section.")
+        return self
+
+
+class DOCXArtifactSection(ArtifactSection):
+    paragraphs: list[PlannedArtifactText] = Field(default_factory=list)
+    bullet_points: list[PlannedArtifactText] = Field(default_factory=list)
+    metrics: list[PlannedArtifactMetric] = Field(default_factory=list)
+    tables: list[PlannedArtifactTable] = Field(default_factory=list)
+    section_id: str | None = None
+    heading_level: int = Field(default=1, ge=1, le=6)
+    mapping_ids: list[str] = Field(default_factory=list)
+    element_order: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_docx_element_order(self) -> "DOCXArtifactSection":
+        _validate_output_order(
+            self.element_order,
+            [item.element_id for item in (*self.paragraphs, *self.bullet_points, *self.metrics, *self.tables)],
+            "DOCX element",
+        )
+        return self
 
 
 class DOCXArtifactContent(BaseModel):
@@ -77,7 +143,24 @@ class DOCXArtifactContent(BaseModel):
 
     target_format: Literal["docx"]
     document_title: str = Field(min_length=1)
-    sections: list[ArtifactSection] = Field(min_length=1)
+    sections: list[DOCXArtifactSection] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def section_ids_are_unique(self) -> "DOCXArtifactContent":
+        ids = [section.section_id for section in self.sections if section.section_id is not None]
+        if len(ids) != len(set(ids)):
+            raise ValueError("DOCX artifact section IDs must be unique.")
+        return self
+
+
+def _validate_output_order(order: list[str], element_ids: list[str | None], label: str) -> None:
+    if not order and not any(element_ids):
+        return
+    declared = [element_id for element_id in element_ids if element_id is not None]
+    if len(declared) != len(set(declared)):
+        raise ValueError(f"{label} IDs must be unique within their output section.")
+    if len(order) != len(set(order)) or set(order) != set(declared):
+        raise ValueError(f"{label} order must list every declared ID exactly once.")
 
 
 class PPTXTitleElement(BaseModel):

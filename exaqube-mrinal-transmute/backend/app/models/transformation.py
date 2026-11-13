@@ -273,6 +273,13 @@ class HTMLOutputStructure(BaseModel):
     include_navigation: bool = True
     sections: list[HTMLSectionPlan] = Field(min_length=1)
 
+    @model_validator(mode="after")
+    def main_semantic_section_is_unambiguous(self) -> "HTMLOutputStructure":
+        main_sections = [section.section_id for section in self.sections if section.semantic_element == "main"]
+        if len(main_sections) > 1 or (main_sections and len(self.sections) > 1):
+            raise ValueError("A main semantic section must be the only top-level HTML output section.")
+        return self
+
 
 OutputStructure = Annotated[
     Union[PPTXOutputStructure, XLSXOutputStructure, DOCXOutputStructure, MMDOutputStructure, HTMLOutputStructure],

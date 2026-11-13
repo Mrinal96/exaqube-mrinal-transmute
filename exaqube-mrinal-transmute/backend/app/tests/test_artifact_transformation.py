@@ -2,13 +2,14 @@
 
 import json
 import logging
+from io import BytesIO
 from uuid import UUID
 
 import pytest
 from pydantic import ValidationError
 
 from app.models.documents import DocumentFormat
-from app.models.artifacts import ArtifactMetric, ArtifactSection, ArtifactTable, ArtifactText, HTMLArtifactSection
+from app.models.artifacts import ArtifactMetric, ArtifactSection, ArtifactTable, ArtifactText, DOCXArtifactContent, DOCXArtifactSection, HTMLArtifactContent, HTMLArtifactSection, PlannedArtifactMetric, PlannedArtifactTable, PlannedArtifactText
 from app.models.intermediate import DocumentIR, IRBlock, IRSection, ProvenanceRecord, SourceLocation, TableData
 from app.models.interpretation import (
     DocumentInterpretation,
@@ -26,7 +27,11 @@ from app.models.llm import LLMCompletionResult, LLMTokenUsage
 from app.models.transformation import (
     ContentMapping,
     DOCXOutputStructure,
+    DOCXElementPlan,
     DOCXSectionPlan,
+    HTMLComponentPlan,
+    HTMLSectionPlan,
+    HTMLOutputStructure,
     PlanDestination,
     PlanSourceItem,
     PlanValidationRules,
@@ -37,10 +42,15 @@ from app.models.transformation import (
 from app.prompts.artifact import build_artifact_messages
 from app.services.artifact_transformation import (
     InvalidArtifactContentError,
+    UnsupportedArtifactElementError,
     _to_html_section,
     _parse_artifact_content,
     validate_artifact_references,
+    _validate_docx_plan_alignment,
+    _validate_html_plan_alignment,
+    _reject_unsupported_html_plan_elements,
 )
+from app.services.artifact_renderers import render_docx, render_html
 from app.services.interpretation import UnresolvedSourceReferenceError
 from app.storage.interpretations import InterpretationStore
 
@@ -350,6 +360,173 @@ def test_artifact_parser_accepts_valid_groq_style_json():
     assert parsed.sections[0].paragraphs[0].text == "Revenue was $500,000 in Q3 2026."
 
 
+def test_docx_planned_alignment_preserves_heading_levels_mapping_destinations_and_order():
+    ir, interpretation, base_plan = _planned_render_inputs(item_count=1)
+    first, second = base_plan.content_mappings
+    mappings = [
+        first.model_copy(update={"destination": PlanDestination(target_type="doc_element", target_id="element-paragraph")}),
+        second.model_copy(update={"destination": PlanDestination(target_type="doc_element", target_id="element-table")}),
+    ]
+    structure = DOCXOutputStructure(
+        target_format="docx",
+        document_title="Quarterly Report",
+        sections=[DOCXSectionPlan(
+            section_id="section-report",
+            title="Quarterly Revenue",
+            heading_level=2,
+            purpose="Summarize sourced figures.",
+            elements=[
+                DOCXElementPlan(element_id="element-paragraph", element_type="paragraph", purpose="Report fact."),
+                DOCXElementPlan(element_id="element-table", element_type="table", purpose="Report metric."),
+            ],
+        )],
+    )
+    plan = base_plan.model_copy(update={"output_structure": structure, "content_mappings": mappings})
+    content = DOCXArtifactContent(
+        target_format="docx",
+        document_title="Quarterly Report",
+        sections=[DOCXArtifactSection(
+            section_id="section-report",
+            heading="Quarterly Revenue",
+            heading_level=2,
+            element_order=["element-paragraph", "element-table"],
+            paragraphs=[PlannedArtifactText(
+                text=interpretation.facts[0].statement,
+                source_references=first.source_references,
+                element_id="element-paragraph",
+                element_type="paragraph",
+                mapping_ids=[first.mapping_id],
+            )],
+            metrics=[PlannedArtifactMetric(
+                name=interpretation.metrics[0].name,
+                value=interpretation.metrics[0].value,
+                currency=interpretation.metrics[0].currency,
+                reporting_period=interpretation.metrics[0].reporting_period,
+                source_references=second.source_references,
+                element_id="element-table",
+                mapping_ids=[second.mapping_id],
+            )],
+        )],
+    )
+
+    _validate_docx_plan_alignment(content, plan)
+    output = render_docx(content, is_mock=False)
+    from docx import Document as WordDocument
+    rendered = WordDocument(BytesIO(output))
+    assert [(item.text, item.style.name) for item in rendered.paragraphs[:2]] == [
+        ("Quarterly Report", "Title"), ("Quarterly Revenue", "Heading 2")
+    ]
+
+    invalid_order = content.model_copy(deep=True)
+    invalid_order.sections[0].element_order.reverse()
+    with pytest.raises(InvalidArtifactContentError, match="ordering"):
+        _validate_docx_plan_alignment(invalid_order, plan)
+    invalid_destination = plan.model_copy(update={
+        "content_mappings": [
+            mappings[0].model_copy(update={"destination": PlanDestination(target_type="doc_section", target_id="section-report")}),
+            mappings[1],
+        ]
+    })
+    with pytest.raises(InvalidArtifactContentError, match="mappings"):
+        _validate_docx_plan_alignment(content, invalid_destination)
+
+
+def test_html_planned_alignment_respects_semantics_navigation_ids_and_references():
+    ir, interpretation, base_plan = _planned_render_inputs(item_count=1)
+    first, second = base_plan.content_mappings
+    mappings = [
+        first.model_copy(update={"destination": PlanDestination(target_type="html_component", target_id="component-summary")}),
+        second.model_copy(update={"destination": PlanDestination(target_type="html_component", target_id="component-metric")}),
+    ]
+    structure = HTMLOutputStructure(
+        target_format="html",
+        page_title="Quarterly Report",
+        include_navigation=False,
+        sections=[HTMLSectionPlan(
+            section_id="section-report",
+            heading="Quarterly Revenue",
+            semantic_element="article",
+            purpose="Summarize sourced revenue.",
+            components=[
+                HTMLComponentPlan(component_id="component-summary", component_type="paragraph", purpose="State the result."),
+                HTMLComponentPlan(component_id="component-metric", component_type="metric_card", purpose="Show the value."),
+            ],
+        )],
+    )
+    plan = base_plan.model_copy(update={
+        "target_format": DocumentFormat.HTML,
+        "output_structure": structure,
+        "content_mappings": mappings,
+    })
+    content = HTMLArtifactContent(
+        target_format="html",
+        page_title="Quarterly Report",
+        include_navigation=False,
+        sections=[HTMLArtifactSection(
+            section_id="section-report",
+            heading="Quarterly Revenue",
+            semantic_element="article",
+            purpose="Summarize sourced revenue.",
+            component_order=["component-summary", "component-metric"],
+            paragraphs=[PlannedArtifactText(
+                text=interpretation.facts[0].statement,
+                source_references=first.source_references,
+                element_id="component-summary",
+                element_type="paragraph",
+                mapping_ids=[first.mapping_id],
+            )],
+            metrics=[PlannedArtifactMetric(
+                name=interpretation.metrics[0].name,
+                value=interpretation.metrics[0].value,
+                currency=interpretation.metrics[0].currency,
+                reporting_period=interpretation.metrics[0].reporting_period,
+                source_references=second.source_references,
+                element_id="component-metric",
+                mapping_ids=[second.mapping_id],
+            )],
+        )],
+    )
+
+    _validate_html_plan_alignment(content, plan)
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(render_html(content, is_mock=False), "html.parser")
+    assert soup.find("article", id="section-report") is not None
+    assert soup.find("nav") is None
+    assert soup.find(id="component-summary") is not None
+    assert soup.find(id="component-metric") is not None
+
+    invalid = content.model_copy(deep=True)
+    invalid.sections[0].paragraphs[0].mapping_ids = []
+    with pytest.raises(InvalidArtifactContentError, match="mappings"):
+        _validate_html_plan_alignment(invalid, plan)
+
+    invalid_reference = content.model_copy(deep=True)
+    invalid_reference.sections[0].paragraphs[0].source_references = [
+        first.source_references[0].model_copy(update={
+            "source_location": SourceLocation(section_path=["different"], element_index=99)
+        })
+    ]
+    with pytest.raises(InvalidArtifactContentError, match="source references"):
+        _validate_html_plan_alignment(invalid_reference, plan)
+
+
+def test_html_chart_and_link_plan_components_are_rejected_before_provider_generation():
+    _, _, base_plan = _planned_render_inputs(item_count=1)
+    structure = HTMLOutputStructure(
+        target_format="html",
+        page_title="Report",
+        sections=[HTMLSectionPlan(
+            section_id="section",
+            heading="Report",
+            purpose="Present the report.",
+            components=[HTMLComponentPlan(component_id="chart", component_type="chart", purpose="Plot source data.")],
+        )],
+    )
+    plan = base_plan.model_copy(update={"target_format": DocumentFormat.HTML, "output_structure": structure})
+    with pytest.raises(UnsupportedArtifactElementError, match="chart"):
+        _reject_unsupported_html_plan_elements(plan)
+
+
 def test_artifact_parser_accepts_one_complete_markdown_json_fence():
     content = "```json\n" + json.dumps(_valid_docx_payload()) + "\n```"
 
@@ -550,7 +727,19 @@ def test_mock_html_section_conversion_preserves_all_content_and_citations():
     converted = _to_html_section(section)
 
     assert isinstance(converted, HTMLArtifactSection)
-    assert converted.model_dump(mode="python") == section.model_dump(mode="python")
+    for field in ("heading", "paragraphs", "bullet_points", "metrics", "tables"):
+        converted_value = getattr(converted, field)
+        original_value = getattr(section, field)
+        if field in {"paragraphs", "bullet_points", "metrics", "tables"}:
+            assert [
+                item.model_dump(mode="python", exclude={"element_id", "element_type", "label", "mapping_ids"})
+                for item in converted_value
+            ] == [item.model_dump(mode="python") for item in original_value]
+        else:
+            assert converted_value == original_value
+    assert converted.semantic_element == "section"
+    assert converted.mapping_ids == []
+    assert converted.component_order == []
     assert converted.paragraphs[0].source_references[0] == reference
     assert converted.bullet_points[0].source_references[0] == reference
     assert converted.metrics[0].source_references[0] == reference
@@ -590,8 +779,8 @@ def test_artifact_schema_failure_logs_sanitized_diagnostics(caplog):
     assert record.failure_phase == "artifact_schema_validation"
     assert record.target_format == "docx"
     assert record.schema_model == "DOCXArtifactContent"
-    assert record.prompt_version == "artifact_v7"
-    assert record.artifact_schema_version == "1.1"
+    assert record.prompt_version == "artifact_v8"
+    assert record.artifact_schema_version == "1.2"
     assert record.json_parsing_succeeded is True
     assert record.content_empty is False
     assert record.contains_markdown_code_fence is False

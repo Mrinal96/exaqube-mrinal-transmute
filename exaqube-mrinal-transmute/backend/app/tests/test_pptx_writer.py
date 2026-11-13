@@ -375,6 +375,16 @@ def test_schema_requires_source_references_for_content_items():
         PPTXArtifactContent.model_validate(payload)
 
 
+def test_pptx_text_schema_does_not_accept_docx_or_html_plan_identity_fields():
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ArtifactText.model_validate({
+            "text": "Revenue grew.",
+            "source_references": [_reference().model_dump(mode="python")],
+            "element_id": "html-component-1",
+            "mapping_ids": ["mapping-1"],
+        })
+
+
 def test_planned_image_placeholders_remain_explicitly_unsupported():
     element_type = "image_placeholder"
     plan = TransformationPlan(

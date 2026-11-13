@@ -6,7 +6,12 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from app.services.llm_client import LLMClientError, LLMErrorCategory, LLMTruncatedResponseError
+from app.services.llm_client import (
+    LLMClientError,
+    LLMErrorCategory,
+    LLMProviderError,
+    LLMTruncatedResponseError,
+)
 from app.services.interpretation import InvalidInterpretationResponseError, UnresolvedSourceReferenceError
 from app.services.planning import (
     DocumentInterpretationMismatchError,
@@ -104,23 +109,59 @@ def register_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(LLMClientError)
     async def llm_error_handler(request: Request, exc: LLMClientError) -> JSONResponse:
+        details = None
         if isinstance(exc, LLMTruncatedResponseError):
-            status_code, code, message = (
-                502,
-                "llm_output_truncated",
-                "The LLM provider truncated its response before completing the structured output.",
+            status_code, code, message = 502, "llm_output_truncated", (
+                "The LLM provider truncated its response before completing the structured output. "
+                "Retry with a smaller source or simpler target instructions."
             )
+            if exc.recovery_attempted:
+                message = (
+                    "The planning response remained truncated after one compact recovery attempt. "
+                    "Retry with a smaller source or simpler target instructions."
+                )
+                details = {"recovery_attempted": True, "recovery_attempts": 1}
         elif exc.category == LLMErrorCategory.TIMEOUT:
             status_code, code, message = 504, "llm_timeout", "The LLM provider request timed out."
         elif exc.category == LLMErrorCategory.CONFIGURATION:
             status_code, code, message = 503, "llm_unavailable", "The LLM provider is not configured."
         elif exc.category == LLMErrorCategory.INVALID_RESPONSE:
             status_code, code, message = 502, "llm_invalid_response", "The LLM provider returned an invalid response."
+        elif isinstance(exc, LLMProviderError) and exc.status_code == 413:
+            status_code, code, message = (
+                413,
+                "llm_request_too_large",
+                "The provider rejected this request as too large. Reduce the input or request budget and retry.",
+            )
+            details = {"provider_status": 413, "retryable": False}
+        elif isinstance(exc, LLMProviderError) and exc.status_code == 429:
+            details = {
+                key: value
+                for key, value in {
+                    "provider_status": 429,
+                    "rate_limit_kind": exc.rate_limit_kind,
+                    "retryable": exc.retryable,
+                    "retry_after_seconds": exc.selected_retry_delay_seconds or exc.retry_after_seconds,
+                }.items()
+                if value is not None
+            }
+            if exc.rate_limit_kind == "tpd":
+                status_code, code, message = 429, "llm_rate_limit_tpd", "The provider's daily token allowance is exhausted. Try again after the daily limit resets."
+            elif exc.rate_limit_kind == "rpd":
+                status_code, code, message = 429, "llm_rate_limit_rpd", "The provider's daily request allowance is exhausted. Try again after the daily limit resets."
+            elif exc.rate_limit_kind == "quota":
+                status_code, code, message = 429, "llm_quota_exhausted", "The provider account quota or billing limit is exhausted. Check the provider account limits."
+            elif exc.rate_limit_kind == "tpm":
+                status_code, code, message = 429, "llm_rate_limit_tpm", "The provider's per-minute token limit was reached. Wait for the token window to reset and retry."
+            elif exc.rate_limit_kind == "rpm":
+                status_code, code, message = 429, "llm_rate_limit_rpm", "The provider's per-minute request limit was reached. Wait before retrying."
+            else:
+                status_code, code, message = 429, "llm_rate_limited", "The provider rate limit was reached. Wait before retrying."
         elif exc.category == LLMErrorCategory.PROVIDER and exc.status_code is not None and exc.status_code < 500 and exc.status_code != 429:
             status_code, code, message = 502, "llm_provider_error", "The LLM provider could not complete the request."
         else:
             status_code, code, message = 503, "llm_unavailable", "The LLM provider is temporarily unavailable."
-        return JSONResponse(status_code=status_code, content=_error_payload(request, code, message))
+        return JSONResponse(status_code=status_code, content=_error_payload(request, code, message, details))
 
     @app.exception_handler(StarletteHTTPException)
     async def http_error_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:

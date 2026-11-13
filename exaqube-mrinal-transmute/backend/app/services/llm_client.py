@@ -91,7 +91,7 @@ class LLMProviderError(LLMClientError):
         selected_retry_delay_seconds: float | None = None,
         retryable: bool | None = None,
     ) -> None:
-        is_permanent_quota_error = rate_limit_kind == "quota"
+        is_permanent_quota_error = rate_limit_kind in {"quota", "tpd", "rpd"}
         super().__init__(
             LLMErrorCategory.PROVIDER,
             f"The LLM provider returned HTTP {status_code}.",
@@ -127,15 +127,24 @@ class LLMInvalidResponseError(LLMClientError):
 
 
 class LLMTruncatedResponseError(LLMInvalidResponseError):
-    def __init__(self, usage: LLMTokenUsage | None = None) -> None:
+    def __init__(
+        self,
+        usage: LLMTokenUsage | None = None,
+        *,
+        recovery_attempted: bool = False,
+    ) -> None:
+        message = "The LLM provider truncated its completion at the output token limit."
+        if recovery_attempted:
+            message += " One compact planning recovery attempt was also truncated."
         super().__init__(
-            "The LLM provider truncated its completion at the output token limit.",
+            message,
             failure_phase="completion_finish_reason",
             failure_reason="length",
             operation_usage=usage,
         )
         self.operation_usage = usage
         self.operation_error_category = "truncated_completion"
+        self.recovery_attempted = recovery_attempted
 
 
 class LLMClient(Protocol):
@@ -166,7 +175,9 @@ class OpenAICompatibleClient:
 
     GROQ_GPT_OSS_120B = "openai/gpt-oss-120b"
     GROQ_GPT_OSS_20B = "openai/gpt-oss-20b"
+    GROQ_GPT_OSS_MAX_COMPLETION_TOKENS = 65_536
     GROQ_COMPLETION_TOKEN_BUDGET = 8192
+    GROQ_GPT_OSS_20B_DEFAULT_COMPLETION_TOKENS = 1024
     GROQ_TPM_LIMIT = 8000
     GROQ_PROMPT_ESTIMATE_SAFETY_TOKENS = 256
     GROQ_PROMPT_BYTES_PER_TOKEN_ESTIMATE = 3.5
@@ -193,8 +204,12 @@ class OpenAICompatibleClient:
         self.model = model.strip()
         self._api_key = api_key.strip()
         self.max_rate_limit_wait_seconds = max_rate_limit_wait_seconds
+        self._tpm_limit_tokens = self.GROQ_TPM_LIMIT
         self._tpm_remaining_tokens: int | None = None
         self._tpm_reset_at: float | None = None
+        self._tpm_local_used_tokens = 0
+        self._tpm_reservations: dict[int, int] = {}
+        self._tpm_reservation_sequence = 0
         self._tpm_state_lock = asyncio.Lock()
         self._owns_client = http_client is None
         self._http = http_client or httpx.AsyncClient(timeout=timeout_seconds, transport=transport)
@@ -227,33 +242,34 @@ class OpenAICompatibleClient:
         else:
             estimated_prompt_tokens = (request_prompt_characters + 3) // 4
             prompt_estimate_method = "characters_div_4_approximation"
-        if max_completion_tokens is not None:
-            if (
-                isinstance(max_completion_tokens, bool)
-                or not isinstance(max_completion_tokens, int)
-                or max_completion_tokens <= 0
-            ):
-                raise LLMConfigurationError("The requested completion-token budget must be a positive integer.")
-            effective_completion_budget = max_completion_tokens
+        reservation_id: int | None = None
+        requested_completion_budget = max_completion_tokens
+        if self.model == self.GROQ_GPT_OSS_20B and requested_completion_budget is None:
+            # Groq's chat-completions default is 1024 output tokens. Send it
+            # explicitly so the reservation matches the provider's actual cap.
+            requested_completion_budget = self.GROQ_GPT_OSS_20B_DEFAULT_COMPLETION_TOKENS
+        if requested_completion_budget is not None and (
+            isinstance(requested_completion_budget, bool)
+            or not isinstance(requested_completion_budget, int)
+            or requested_completion_budget <= 0
+        ):
+            raise LLMConfigurationError("The requested completion-token budget must be a positive integer.")
+        if self.model in {self.GROQ_GPT_OSS_20B, self.GROQ_GPT_OSS_120B}:
+            if requested_completion_budget is None:
+                requested_completion_budget = self.GROQ_COMPLETION_TOKEN_BUDGET
+            requested_completion_budget = min(
+                requested_completion_budget,
+                self.GROQ_GPT_OSS_MAX_COMPLETION_TOKENS,
+            )
+        if requested_completion_budget is not None:
+            effective_completion_budget = requested_completion_budget
             if self.model == self.GROQ_GPT_OSS_20B:
-                available_budget = (
-                    self.GROQ_TPM_LIMIT
-                    - estimated_prompt_tokens
-                    - self.GROQ_PROMPT_ESTIMATE_SAFETY_TOKENS
-                )
-                if available_budget < 1:
-                    raise LLMInvalidResponseError(
-                        "The prompt is too large for the provider token budget.",
-                        failure_phase="request_budget_validation",
-                        failure_reason="prompt_exceeds_tpm_budget",
-                    )
-                effective_completion_budget = min(effective_completion_budget, available_budget)
-                effective_completion_budget = await self._respect_tracked_tpm_window(
+                effective_completion_budget, reservation_id = await self._reserve_tpm_budget(
                     estimated_prompt_tokens,
                     effective_completion_budget,
                 )
             body["max_completion_tokens"] = effective_completion_budget
-        if self.model == self.GROQ_GPT_OSS_120B:
+        if self.model in {self.GROQ_GPT_OSS_20B, self.GROQ_GPT_OSS_120B}:
             body.setdefault("max_completion_tokens", self.GROQ_COMPLETION_TOKEN_BUDGET)
             body["reasoning_effort"] = "low"
         request_body = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -268,25 +284,55 @@ class OpenAICompatibleClient:
                 "prompt_token_estimate_method": prompt_estimate_method,
                 "request_message_count": len(messages),
                 "requested_max_completion_tokens": max_completion_tokens,
+                "effective_requested_completion_tokens": requested_completion_budget,
+                "model_max_completion_tokens": (
+                    self.GROQ_GPT_OSS_MAX_COMPLETION_TOKENS
+                    if self.model in {self.GROQ_GPT_OSS_20B, self.GROQ_GPT_OSS_120B}
+                    else None
+                ),
                 "max_completion_tokens": body.get("max_completion_tokens"),
+                "reasoning_effort": body.get("reasoning_effort"),
+                "completion_budget_includes_reasoning": self.model in {self.GROQ_GPT_OSS_20B, self.GROQ_GPT_OSS_120B},
                 "tpm_window_remaining_tokens": self._tpm_remaining_tokens,
                 "tpm_window_reset_seconds": self._current_tpm_reset_seconds(),
+                "tpm_limit_tokens": self._tpm_limit_tokens,
+                "tpm_reserved_tokens": sum(self._tpm_reservations.values()),
+                "tpm_safety_margin_tokens": self.GROQ_PROMPT_ESTIMATE_SAFETY_TOKENS,
+                "tpm_available_capacity_tokens": (
+                    max(0, (self._tpm_remaining_tokens if self._tpm_remaining_tokens is not None
+                            else self._tpm_limit_tokens - self._tpm_local_used_tokens)
+                        - sum(self._tpm_reservations.values()))
+                    if self.model == self.GROQ_GPT_OSS_20B else None
+                ),
             },
         )
         try:
             response = await self._http.post(self.url, content=request_body, headers=headers)
+        except asyncio.CancelledError:
+            await self._reconcile_unknown_tpm_reservation(reservation_id)
+            raise
         except httpx.TimeoutException as exc:
+            await self._reconcile_unknown_tpm_reservation(reservation_id)
             raise LLMTimeoutError() from exc
         except httpx.RequestError as exc:
+            await self._reconcile_unknown_tpm_reservation(reservation_id)
             raise LLMConnectionError() from exc
+        except Exception:
+            await self._reconcile_unknown_tpm_reservation(reservation_id)
+            raise
 
-        self._record_tpm_window(response.headers)
         if response.status_code >= 400:
+            await self._reconcile_tpm_reservation(
+                reservation_id, response.headers, None, status_code=response.status_code
+            )
             raise _provider_error(response)
 
         try:
             payload = response.json()
         except (ValueError, UnicodeDecodeError) as exc:
+            await self._reconcile_tpm_reservation(
+                reservation_id, response.headers, None, status_code=response.status_code
+            )
             error = LLMInvalidResponseError(
                 "The LLM provider response was not valid JSON.",
                 failure_phase="provider_response_json_parse",
@@ -299,8 +345,15 @@ class OpenAICompatibleClient:
         try:
             usage = _parse_token_usage(raw_usage)
         except LLMInvalidResponseError as exc:
+            await self._reconcile_tpm_reservation(
+                reservation_id, response.headers, None, status_code=response.status_code
+            )
             _log_invalid_response(exc, payload, None, raw_usage=raw_usage, cause=exc.__cause__)
             raise
+
+        await self._reconcile_tpm_reservation(
+            reservation_id, response.headers, usage, status_code=response.status_code
+        )
 
         response_metadata = _response_metadata(payload)
         response_metadata["typed_token_usage_available"] = usage is not None
@@ -339,88 +392,173 @@ class OpenAICompatibleClient:
     def _estimate_groq_prompt_tokens(cls, prompt_bytes: int) -> int:
         return math.ceil(prompt_bytes / cls.GROQ_PROMPT_BYTES_PER_TOKEN_ESTIMATE)
 
-    def _record_tpm_window(self, headers: httpx.Headers) -> None:
-        if self.model != self.GROQ_GPT_OSS_20B:
+    def _expire_tpm_window_locked(self) -> None:
+        if self._tpm_reset_at is not None and self._tpm_reset_at <= time.monotonic():
+            self._tpm_remaining_tokens = None
+            self._tpm_reset_at = None
+            self._tpm_local_used_tokens = 0
+
+    async def _reserve_tpm_budget(
+        self,
+        estimated_prompt_tokens: int,
+        requested_completion_tokens: int,
+    ) -> tuple[int, int]:
+        """Recompute prompt/output headroom atomically, without locking during network I/O.
+
+        This is process-local coordination. Multiple backend replicas need a shared limiter.
+        After a tracked reset, the loop expires that snapshot and recalculates from the
+        current limit, prompt estimate, safety margin, and all still-active reservations.
+        """
+        while True:
+            wait_until: float | None = None
+            wait_reset_snapshot: float | None = None
+            async with self._tpm_state_lock:
+                self._expire_tpm_window_locked()
+                limit = self._tpm_limit_tokens or self.GROQ_TPM_LIMIT
+                baseline = (
+                    self._tpm_remaining_tokens
+                    if self._tpm_remaining_tokens is not None
+                    else max(0, limit - self._tpm_local_used_tokens)
+                )
+                in_flight = sum(self._tpm_reservations.values())
+                available = max(0, baseline - in_flight)
+                available_completion = (
+                    available
+                    - estimated_prompt_tokens
+                    - self.GROQ_PROMPT_ESTIMATE_SAFETY_TOKENS
+                )
+                delay = self._current_tpm_reset_seconds()
+                if available_completion < requested_completion_tokens and delay is not None and delay > 0:
+                    if delay <= self.max_rate_limit_wait_seconds:
+                        wait_until = delay
+                        wait_reset_snapshot = self._tpm_reset_at
+                    elif available_completion <= 0:
+                        raise LLMInvalidResponseError(
+                            "The current provider token window cannot fit this prompt; retry after the token window resets.",
+                            failure_phase="request_budget_validation",
+                            failure_reason="tpm_window_headroom_insufficient",
+                        )
+
+                if wait_until is None:
+                    if available_completion < 1:
+                        raise LLMInvalidResponseError(
+                            "The prompt leaves no safe completion budget within the provider token window.",
+                            failure_phase="request_budget_validation",
+                            failure_reason="prompt_exceeds_tpm_budget",
+                        )
+                    completion_budget = min(requested_completion_tokens, available_completion)
+                    reserved_tokens = (
+                        estimated_prompt_tokens
+                        + completion_budget
+                        + self.GROQ_PROMPT_ESTIMATE_SAFETY_TOKENS
+                    )
+                    self._tpm_reservation_sequence += 1
+                    reservation_id = self._tpm_reservation_sequence
+                    self._tpm_reservations[reservation_id] = reserved_tokens
+                    if completion_budget < requested_completion_tokens:
+                        logger.warning(
+                            "llm_tpm_budget_clamped_to_current_window",
+                            extra={
+                                "tpm_window_remaining_tokens": baseline,
+                                "tpm_window_reset_seconds": delay,
+                                "tpm_limit_tokens": limit,
+                                "tpm_reserved_tokens": reserved_tokens,
+                                "estimated_prompt_tokens": estimated_prompt_tokens,
+                                "requested_max_completion_tokens": requested_completion_tokens,
+                                "effective_requested_completion_tokens": requested_completion_tokens,
+                                "max_completion_tokens": completion_budget,
+                                "retry_stop_reason": "completion_budget_limited_by_tpm_headroom",
+                                "tpm_safety_margin_tokens": self.GROQ_PROMPT_ESTIMATE_SAFETY_TOKENS,
+                            },
+                        )
+                    return completion_budget, reservation_id
+
+            logger.info(
+                "llm_tpm_window_wait",
+                extra={
+                    "tpm_window_remaining_tokens": self._tpm_remaining_tokens,
+                    "tpm_window_reset_seconds": wait_until,
+                    "tpm_limit_tokens": self._tpm_limit_tokens,
+                    "estimated_prompt_tokens": estimated_prompt_tokens,
+                    "requested_max_completion_tokens": requested_completion_tokens,
+                    "retry_stop_reason": "wait_for_tpm_window_reset",
+                },
+            )
+            await asyncio.sleep(wait_until + 0.01)
+            async with self._tpm_state_lock:
+                # The sleep can be replaced by a test clock. Expire the same snapshot
+                # explicitly once its scheduled reset has been awaited.
+                if self._tpm_reset_at == wait_reset_snapshot and self._tpm_reset_at is not None:
+                    self._tpm_remaining_tokens = None
+                    self._tpm_reset_at = None
+                    self._tpm_local_used_tokens = 0
+
+    async def _reconcile_unknown_tpm_reservation(self, reservation_id: int | None) -> None:
+        if reservation_id is None:
+            return
+        async with self._tpm_state_lock:
+            reserved = self._tpm_reservations.pop(reservation_id, 0)
+            self._tpm_remaining_tokens = None
+            self._tpm_reset_at = None
+            self._tpm_limit_tokens = self.GROQ_TPM_LIMIT
+            self._tpm_local_used_tokens += reserved
+            if reserved:
+                self._tpm_reset_at = time.monotonic() + 60.0
+
+    async def _reconcile_tpm_reservation(
+        self,
+        reservation_id: int | None,
+        headers: httpx.Headers,
+        usage: LLMTokenUsage | None,
+        *,
+        status_code: int,
+    ) -> None:
+        if reservation_id is None:
             return
         safe_headers = _safe_rate_limit_headers(headers)
-        remaining_value = safe_headers.get("x-ratelimit-remaining-tokens")
-        reset_value = safe_headers.get("x-ratelimit-reset-tokens")
         try:
-            remaining = int(remaining_value) if remaining_value is not None else None
+            header_limit = int(safe_headers.get("x-ratelimit-limit-tokens", ""))
+            if header_limit <= 0:
+                header_limit = self.GROQ_TPM_LIMIT
         except ValueError:
-            remaining = None
-        reset_seconds = _parse_provider_duration(reset_value)
-        if remaining is None or remaining < 0 or reset_seconds is None:
-            return
-        self._tpm_remaining_tokens = remaining
-        self._tpm_reset_at = time.monotonic() + reset_seconds
+            header_limit = self.GROQ_TPM_LIMIT
+        try:
+            remaining = int(safe_headers.get("x-ratelimit-remaining-tokens", ""))
+            if remaining < 0:
+                remaining = -1
+        except ValueError:
+            remaining = -1
+        reset_seconds = _parse_provider_duration(safe_headers.get("x-ratelimit-reset-tokens"))
+        retry_after = _retry_after_seconds(safe_headers.get("retry-after"))
+
+        async with self._tpm_state_lock:
+            reserved = self._tpm_reservations.pop(reservation_id, 0)
+            self._tpm_limit_tokens = header_limit
+            if remaining >= 0 and reset_seconds is not None:
+                self._tpm_remaining_tokens = min(remaining, header_limit)
+                self._tpm_reset_at = time.monotonic() + reset_seconds
+                self._tpm_local_used_tokens = max(0, header_limit - self._tpm_remaining_tokens)
+                return
+
+            # Do not keep a stale provider snapshot if a response omits or corrupts
+            # either window field. Keep a local conservative estimate instead.
+            self._tpm_remaining_tokens = None
+            self._tpm_reset_at = None
+            consumed = 0
+            if usage is not None and usage.total_tokens is not None:
+                consumed = usage.total_tokens
+            elif status_code < 400 or status_code == 429 or status_code >= 500:
+                consumed = reserved
+            self._tpm_local_used_tokens += consumed
+            if self._tpm_local_used_tokens:
+                self._tpm_reset_at = time.monotonic() + max(60.0, retry_after or 0.0)
+            else:
+                self._tpm_reset_at = None
 
     def _current_tpm_reset_seconds(self) -> float | None:
         if self._tpm_reset_at is None:
             return None
         return max(0.0, self._tpm_reset_at - time.monotonic())
-
-    async def _respect_tracked_tpm_window(
-        self,
-        estimated_prompt_tokens: int,
-        completion_budget: int,
-    ) -> int:
-        if self._tpm_remaining_tokens is None or self._tpm_reset_at is None:
-            return completion_budget
-
-        async with self._tpm_state_lock:
-            remaining = self._tpm_remaining_tokens
-            reset_at = self._tpm_reset_at
-            delay = max(0.0, reset_at - time.monotonic())
-            if delay <= 0:
-                self._tpm_remaining_tokens = None
-                self._tpm_reset_at = None
-                return completion_budget
-
-            available_completion = (
-                remaining
-                - estimated_prompt_tokens
-                - self.GROQ_PROMPT_ESTIMATE_SAFETY_TOKENS
-            )
-            if available_completion >= completion_budget:
-                return completion_budget
-
-            if delay <= self.max_rate_limit_wait_seconds:
-                logger.info(
-                    "llm_tpm_window_wait",
-                    extra={
-                        "tpm_window_remaining_tokens": remaining,
-                        "tpm_window_reset_seconds": delay,
-                        "estimated_prompt_tokens": estimated_prompt_tokens,
-                        "requested_max_completion_tokens": completion_budget,
-                        "retry_stop_reason": "wait_for_tpm_window_reset",
-                    },
-                )
-                await asyncio.sleep(delay + 0.01)
-                if self._tpm_reset_at == reset_at:
-                    self._tpm_remaining_tokens = None
-                    self._tpm_reset_at = None
-                return completion_budget
-
-            if available_completion > 0:
-                logger.warning(
-                    "llm_tpm_budget_clamped_to_current_window",
-                    extra={
-                        "tpm_window_remaining_tokens": remaining,
-                        "tpm_window_reset_seconds": delay,
-                        "estimated_prompt_tokens": estimated_prompt_tokens,
-                        "requested_max_completion_tokens": completion_budget,
-                        "max_completion_tokens": available_completion,
-                        "retry_stop_reason": "window_reset_exceeds_wait_cap",
-                    },
-                )
-                return min(completion_budget, available_completion)
-
-            raise LLMInvalidResponseError(
-                "The current provider token window cannot fit this prompt; retry after the token window resets.",
-                failure_phase="request_budget_validation",
-                failure_reason="tpm_window_headroom_insufficient",
-            )
 
     @staticmethod
     def _parse_completion(payload: object) -> tuple[str, str | None, str | None]:
@@ -486,6 +624,7 @@ def _response_metadata(payload: object) -> dict[str, object]:
         "content_empty": None,
         "content_char_count": None,
         "usage_extra_fields": [],
+        "reasoning_tokens": None,
     }
     if not isinstance(payload, dict):
         return metadata
@@ -502,6 +641,14 @@ def _response_metadata(payload: object) -> dict[str, object]:
             metadata[token_field] = (
                 token_count if isinstance(token_count, int) and not isinstance(token_count, bool)
                 and token_count >= 0 else None
+            )
+        completion_details = raw_usage.get("completion_tokens_details")
+        if isinstance(completion_details, dict):
+            reasoning_tokens = completion_details.get("reasoning_tokens")
+            metadata["reasoning_tokens"] = (
+                reasoning_tokens
+                if isinstance(reasoning_tokens, int) and not isinstance(reasoning_tokens, bool) and reasoning_tokens >= 0
+                else None
             )
     choices = payload.get("choices")
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
@@ -611,14 +758,13 @@ def _provider_error(response: httpx.Response) -> LLMProviderError:
     error_type = _safe_provider_label(provider_error.get("type"))
     message = _sanitize_provider_error_message(provider_error.get("message"))
     headers = _safe_rate_limit_headers(response.headers)
-    rate_limit_kind = (
-        _classify_rate_limit(code, error_type, message, headers)
-        if response.status_code == 429 else None
-    )
+    rate_limit_kind = _classify_rate_limit(code, error_type, message, headers) if response.status_code == 429 else None
     retry_after = _retry_after_seconds(headers.get("retry-after"))
     rate_limit_reset = None
-    if rate_limit_kind in {"rpm", "tpm"}:
-        reset_key = "x-ratelimit-reset-requests" if rate_limit_kind == "rpm" else "x-ratelimit-reset-tokens"
+    if rate_limit_kind in {"rpd", "tpm"}:
+        # Groq's request reset header is RPD. It must not be applied to an RPM
+        # classification from provider prose.
+        reset_key = "x-ratelimit-reset-requests" if rate_limit_kind == "rpd" else "x-ratelimit-reset-tokens"
         rate_limit_reset = _parse_provider_duration(headers.get(reset_key))
     selected_retry_delay = retry_after
     if rate_limit_kind == "tpm":
@@ -637,7 +783,7 @@ def _provider_error(response: httpx.Response) -> LLMProviderError:
         rate_limit_headers=headers,
         rate_limit_reset_seconds=rate_limit_reset,
         selected_retry_delay_seconds=selected_retry_delay,
-        retryable=(response.status_code == 429 and rate_limit_kind != "quota")
+        retryable=(response.status_code == 429 and rate_limit_kind not in {"quota", "tpd", "rpd"})
         or response.status_code >= 500,
     )
     log_event = "llm_provider_http_error"
@@ -652,6 +798,7 @@ def _provider_error(response: httpx.Response) -> LLMProviderError:
             "provider_error_type": error_type,
             "provider_error_message": message,
             "rate_limit_kind": rate_limit_kind,
+            "rate_limit_scope": rate_limit_kind,
             "rate_limit_headers": headers,
             "retry_after_seconds": retry_after,
             "rate_limit_reset_seconds": rate_limit_reset,
@@ -708,21 +855,63 @@ def _classify_rate_limit(
     if any(term in code or term in error_type for term in quota_codes):
         return "quota"
 
-    # Provider code/type identify transient TPM/RPM errors even if prose mentions a quota.
-    is_rate_limit_error = code in {"rate_limit_exceeded", "rate_limit_error", "too_many_requests"}
-    if is_rate_limit_error or error_type in {"token", "tokens", "request", "requests"}:
-        if error_type in {"token", "tokens"} or headers.get("x-ratelimit-remaining-tokens") == "0":
-            return "tpm"
-        if error_type in {"request", "requests"} or headers.get("x-ratelimit-remaining-requests") == "0":
-            return "rpm"
-        return "rate_limit"
+    # Explicit scope in provider prose takes precedence over generic `tokens` or
+    # `requests` types. Groq's x-ratelimit request headers specifically describe RPD.
+    if any(term in code or term in error_type for term in ("insufficient_quota", "billing", "payment", "spend_limit")):
+        return "quota"
+    text = f"{message} {error_type} {code}"
+    if re.search(r"\btpd\b", text):
+        return "tpd"
+    if re.search(r"\brpd\b", text):
+        return "rpd"
+    if re.search(r"\btpm\b", text):
+        return "tpm"
+    if re.search(r"\brpm\b", text):
+        return "rpm"
+    has_daily_scope = any(term in message for term in ("per day", "per-day", "per_day", "daily"))
+    has_minute_scope = any(term in message for term in ("per minute", "per-minute", "per_minute"))
+    message_is_token_limit = "token" in message or "tokens" in message
+    message_is_request_limit = "request" in message or "requests" in message
 
+    # Prefer the provider's named resource when it is present; unrelated always-on
+    # headers for another resource do not override an explicit message.
+    if has_daily_scope:
+        if message_is_token_limit:
+            return "tpd"
+        if message_is_request_limit:
+            return "rpd"
+        if error_type in {"token", "tokens"}:
+            return "tpd"
+        if error_type in {"request", "requests"}:
+            return "rpd"
+    if has_minute_scope:
+        if message_is_token_limit:
+            return "tpm"
+        if message_is_request_limit:
+            return "rpm"
+        if error_type in {"token", "tokens"}:
+            return "tpm"
+        if error_type in {"request", "requests"}:
+            return "rpm"
     if any(term in message for term in ("insufficient quota", "quota", "billing", "payment", "spend limit")):
         return "quota"
-    if "token" in message or headers.get("x-ratelimit-remaining-tokens") == "0":
+
+    if error_type in {"token", "tokens"}:
         return "tpm"
-    if "request" in message or headers.get("x-ratelimit-remaining-requests") == "0":
-        return "rpm"
+    if error_type in {"request", "requests"}:
+        # Groq's request bucket is RPD. Without a zero remaining header, retain
+        # a generic scope instead of incorrectly labeling it RPM.
+        return "rpd" if headers.get("x-ratelimit-remaining-requests") == "0" else "rate_limit"
+
+    # Groq documents x-ratelimit-*-requests as requests-per-day, not per-minute.
+    if headers.get("x-ratelimit-remaining-requests") == "0":
+        return "rpd"
+    if headers.get("x-ratelimit-remaining-tokens") == "0":
+        return "tpm"
+    if "token" in message:
+        return "tpm"
+    if "request" in message:
+        return "rate_limit"
     return "rate_limit"
 
 
